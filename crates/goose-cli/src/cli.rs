@@ -701,6 +701,7 @@ pub async fn cli() -> Result<()> {
         eprintln!("Warning: Failed to update project tracker: {}", e);
     }
 
+    // Record CLI command metrics
     let command_name = match &cli.command {
         Some(Command::Configure {}) => "configure",
         Some(Command::Info { .. }) => "info",
@@ -718,7 +719,7 @@ pub async fn cli() -> Result<()> {
     };
 
     tracing::info!(
-        monotonic_counter.goose.cli_commands = 1,
+        monotonic_counter.cli_commands = 1,
         command = command_name,
         "CLI command executed"
     );
@@ -897,7 +898,8 @@ pub async fn cli() -> Result<()> {
                     (input_config, None)
                 }
                 (_, _, Some(recipe_name)) => {
-                    tracing::info!(monotonic_counter.goose.recipe_runs = 1,
+                    // Record recipe usage metrics
+                    tracing::info!(monotonic_counter.recipe_runs = 1,
                         recipe_name = %recipe_name,
                         "Recipe execution started"
                     );
