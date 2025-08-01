@@ -172,7 +172,6 @@ impl McpClient {
         request: ClientRequest,
         cancel_token: CancellationToken,
     ) -> Result<ServerResult, Error> {
-        eprintln!("request: {:?}", request);
         let handle = self
             .client
             .lock()
@@ -186,9 +185,7 @@ impl McpClient {
             )
             .await?;
 
-        eprintln!("request handle: {:?}", handle);
         let cancel_token = cancel_token.clone();
-
         tokio::select! {
             res = handle.await_response() => {
                 Ok(res?)

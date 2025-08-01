@@ -1202,7 +1202,6 @@ impl Session {
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    eprintln!("caught ctrl-c");
                     cancel_token_clone.cancel();
                     drop(stream);
                     if let Err(e) = self.handle_interrupted_messages(true).await {
