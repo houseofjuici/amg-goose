@@ -512,7 +512,11 @@ impl ExtensionManager {
     }
 
     // Function that gets executed for read_resource tool
-    pub async fn read_resource(&self, params: Value, cancellation_token: CancellationToken) -> Result<Vec<Content>, ToolError> {
+    pub async fn read_resource(
+        &self,
+        params: Value,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<Content>, ToolError> {
         let uri = params
             .get("uri")
             .and_then(|v| v.as_str())
@@ -523,7 +527,11 @@ impl ExtensionManager {
         // If extension name is provided, we can just look it up
         if extension_name.is_some() {
             let result = self
-                .read_resource_from_extension(uri, extension_name.unwrap(), cancellation_token.clone())
+                .read_resource_from_extension(
+                    uri,
+                    extension_name.unwrap(),
+                    cancellation_token.clone(),
+                )
                 .await?;
             return Ok(result);
         }
@@ -533,7 +541,9 @@ impl ExtensionManager {
         // TODO: do we want to find if a provided uri is in multiple extensions?
         // currently it will return the first match and skip any others
         for extension_name in self.resource_capable_extensions.iter() {
-            let result = self.read_resource_from_extension(uri, extension_name, cancellation_token.clone()).await;
+            let result = self
+                .read_resource_from_extension(uri, extension_name, cancellation_token.clone())
+                .await;
             match result {
                 Ok(result) => return Ok(result),
                 Err(_) => continue,
@@ -578,9 +588,12 @@ impl ExtensionManager {
             .ok_or(ToolError::InvalidParameters(error_msg))?;
 
         let client_guard = client.lock().await;
-        let read_result = client_guard.read_resource(uri, cancellation_token).await.map_err(|_| {
-            ToolError::ExecutionError(format!("Could not read resource with uri: {}", uri))
-        })?;
+        let read_result = client_guard
+            .read_resource(uri, cancellation_token)
+            .await
+            .map_err(|_| {
+                ToolError::ExecutionError(format!("Could not read resource with uri: {}", uri))
+            })?;
 
         let mut result = Vec::new();
         for content in read_result.contents {
@@ -625,13 +638,18 @@ impl ExtensionManager {
             })
     }
 
-    pub async fn list_resources(&self, params: Value, cancellation_token: CancellationToken) -> Result<Vec<Content>, ToolError> {
+    pub async fn list_resources(
+        &self,
+        params: Value,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<Content>, ToolError> {
         let extension = params.get("extension").and_then(|v| v.as_str());
 
         match extension {
             Some(extension_name) => {
                 // Handle single extension case
-                self.list_resources_from_extension(extension_name, cancellation_token).await
+                self.list_resources_from_extension(extension_name, cancellation_token)
+                    .await
             }
             None => {
                 // Handle all extensions case using FuturesUnordered
@@ -641,7 +659,8 @@ impl ExtensionManager {
                 for extension_name in &self.resource_capable_extensions {
                     let token = cancellation_token.clone();
                     futures.push(async move {
-                        self.list_resources_from_extension(extension_name, token).await
+                        self.list_resources_from_extension(extension_name, token)
+                            .await
                     });
                 }
 
@@ -676,7 +695,11 @@ impl ExtensionManager {
         }
     }
 
-    pub async fn dispatch_tool_call(&self, tool_call: ToolCall, cancellation_token: CancellationToken) -> Result<ToolCallResult> {
+    pub async fn dispatch_tool_call(
+        &self,
+        tool_call: ToolCall,
+        cancellation_token: CancellationToken,
+    ) -> Result<ToolCallResult> {
         // Dispatch tool call based on the prefix naming convention
         let (client_name, client) = self
             .get_client_for_tool(&tool_call.name)
@@ -731,7 +754,10 @@ impl ExtensionManager {
             .map(|lp| lp.prompts)
     }
 
-    pub async fn list_prompts(&self, cancellation_token: CancellationToken) -> Result<HashMap<String, Vec<Prompt>>, ToolError> {
+    pub async fn list_prompts(
+        &self,
+        cancellation_token: CancellationToken,
+    ) -> Result<HashMap<String, Vec<Prompt>>, ToolError> {
         let mut futures = FuturesUnordered::new();
 
         for extension_name in self.clients.keys() {
@@ -739,7 +765,8 @@ impl ExtensionManager {
             futures.push(async move {
                 (
                     extension_name,
-                    self.list_prompts_from_extension(extension_name, token).await,
+                    self.list_prompts_from_extension(extension_name, token)
+                        .await,
                 )
             });
         }
@@ -899,15 +926,28 @@ mod tests {
             Err(Error::TransportClosed)
         }
 
-        async fn read_resource(&self, _uri: &str, _cancellation_token: CancellationToken) -> Result<ReadResourceResult, Error> {
+        async fn read_resource(
+            &self,
+            _uri: &str,
+            _cancellation_token: CancellationToken,
+        ) -> Result<ReadResourceResult, Error> {
             Err(Error::TransportClosed)
         }
 
-        async fn list_tools(&self, _next_cursor: Option<String>, _cancellation_token: CancellationToken) -> Result<ListToolsResult, Error> {
+        async fn list_tools(
+            &self,
+            _next_cursor: Option<String>,
+            _cancellation_token: CancellationToken,
+        ) -> Result<ListToolsResult, Error> {
             Err(Error::TransportClosed)
         }
 
-        async fn call_tool(&self, name: &str, _arguments: Value, _cancellation_token: CancellationToken) -> Result<CallToolResult, Error> {
+        async fn call_tool(
+            &self,
+            name: &str,
+            _arguments: Value,
+            _cancellation_token: CancellationToken,
+        ) -> Result<CallToolResult, Error> {
             match name {
                 "tool" | "test__tool" => Ok(CallToolResult {
                     content: vec![],
@@ -1013,7 +1053,9 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager.dispatch_tool_call(tool_call, CancellationToken::default()).await;
+        let result = extension_manager
+            .dispatch_tool_call(tool_call, CancellationToken::default())
+            .await;
         assert!(result.is_ok());
 
         let tool_call = ToolCall {
@@ -1021,7 +1063,9 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager.dispatch_tool_call(tool_call, CancellationToken::default()).await;
+        let result = extension_manager
+            .dispatch_tool_call(tool_call, CancellationToken::default())
+            .await;
         assert!(result.is_ok());
 
         // verify a multiple underscores dispatch
@@ -1030,7 +1074,9 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager.dispatch_tool_call(tool_call, CancellationToken::default()).await;
+        let result = extension_manager
+            .dispatch_tool_call(tool_call, CancellationToken::default())
+            .await;
         assert!(result.is_ok());
 
         // Test unicode in tool name, "client 🚀" should become "client_"
@@ -1039,7 +1085,9 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager.dispatch_tool_call(tool_call, CancellationToken::default()).await;
+        let result = extension_manager
+            .dispatch_tool_call(tool_call, CancellationToken::default())
+            .await;
         assert!(result.is_ok());
 
         let tool_call = ToolCall {
@@ -1047,7 +1095,9 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = extension_manager.dispatch_tool_call(tool_call, CancellationToken::default()).await;
+        let result = extension_manager
+            .dispatch_tool_call(tool_call, CancellationToken::default())
+            .await;
         assert!(result.is_ok());
 
         // this should error out, specifically for an ToolError::ExecutionError

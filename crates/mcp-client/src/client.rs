@@ -8,9 +8,7 @@ use rmcp::{
         ProgressNotificationMethod, ProtocolVersion, ReadResourceRequest, ReadResourceRequestParam,
         ReadResourceResult, ServerNotification, ServerResult,
     },
-    service::{
-        ClientInitializeError, PeerRequestOptions, RunningService
-    },
+    service::{ClientInitializeError, PeerRequestOptions, RunningService},
     transport::IntoTransport,
     ClientHandler, RoleClient, ServiceError, ServiceExt,
 };
