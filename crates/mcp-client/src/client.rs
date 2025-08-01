@@ -9,7 +9,7 @@ use rmcp::{
         ReadResourceResult, ServerNotification, ServerResult,
     },
     service::{
-        ClientInitializeError, PeerRequestOptions, RequestHandle, RunningService, ServiceRole,
+        ClientInitializeError, PeerRequestOptions, RunningService
     },
     transport::IntoTransport,
     ClientHandler, RoleClient, ServiceError, ServiceExt,

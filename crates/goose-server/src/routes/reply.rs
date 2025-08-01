@@ -99,6 +99,7 @@ enum MessageEvent {
         request_id: String,
         message: ServerNotification,
     },
+    Ping,
 }
 
 async fn stream_event(
@@ -113,6 +114,7 @@ async fn stream_event(
         )
     });
     if let Err(_) = tx.send(format!("data: {}\n\n", json)).await {
+        tracing::info!("client hung up");
         cancel_token.cancel();
     }
 }
@@ -207,11 +209,15 @@ async fn reply_handler(
         };
         let saved_message_count = all_messages.len();
 
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => {
                     tracing::info!("Agent task cancelled");
                     break;
+                }
+                _ = heartbeat_interval.tick() => {
+                    stream_event(MessageEvent::Ping, &tx, &cancel_token).await;
                 }
                 response = timeout(Duration::from_millis(500), stream.next()) => {
                     match response {

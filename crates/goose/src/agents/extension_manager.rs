@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::http::{HeaderMap, HeaderName};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::{future, FutureExt};
 use mcp_core::{ToolCall, ToolError};
@@ -12,7 +12,6 @@ use rmcp::transport::{
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::io::AsyncReadExt;
@@ -29,7 +28,7 @@ use crate::agents::extension::{Envs, ProcessExit};
 use crate::config::{Config, ExtensionConfigManager};
 use crate::prompt_template;
 use mcp_client::client::{McpClient, McpClientTrait};
-use rmcp::model::{Content, GetPromptResult, Prompt, Resource, ResourceContents, Tool};
+use rmcp::model::{Content, GetPromptResult, Prompt, ResourceContents, Tool};
 use serde_json::Value;
 
 type McpClientBox = Arc<Mutex<Box<dyn McpClientTrait>>>;
