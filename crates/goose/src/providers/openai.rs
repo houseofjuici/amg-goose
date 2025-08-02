@@ -11,12 +11,15 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
-use super::api_client::{ApiClient, ApiResponse, AuthMethod};
+use super::api_client::{ApiClient, AuthMethod};
 use super::base::{ConfigKey, ModelInfo, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::embedding::{EmbeddingCapable, EmbeddingRequest, EmbeddingResponse};
 use super::errors::ProviderError;
 use super::formats::openai::{create_request, get_usage, response_to_message};
-use super::utils::{emit_debug_trace, get_model, map_http_error_to_provider_error, ImageFormat};
+use super::utils::{
+    emit_debug_trace, get_model, handle_response_openai_compat, handle_status_openai_compat,
+    ImageFormat,
+};
 use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
@@ -25,16 +28,16 @@ use crate::providers::formats::openai::response_to_streaming_message;
 use rmcp::model::Tool;
 
 pub const OPEN_AI_DEFAULT_MODEL: &str = "gpt-4o";
-pub const OPEN_AI_KNOWN_MODELS: &[&str] = &[
-    "gpt-4o",
-    "gpt-4o-mini",
-    "gpt-4-turbo",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-3.5-turbo",
-    "o1",
-    "o3",
-    "o4-mini",
+pub const OPEN_AI_KNOWN_MODELS: &[(&str, usize)] = &[
+    ("gpt-4o", 128_000),
+    ("gpt-4o-mini", 128_000),
+    ("gpt-4.1", 128_000),
+    ("gpt-4.1-mini", 128_000),
+    ("o1", 200_000),
+    ("o3", 200_000),
+    ("gpt-3.5-turbo", 16_385),
+    ("gpt-4-turbo", 128_000),
+    ("o4-mini", 128_000),
 ];
 
 pub const OPEN_AI_DOC_URL: &str = "https://platform.openai.com/docs/models";
@@ -103,40 +106,28 @@ impl OpenAiProvider {
         })
     }
 
-    async fn post(&self, payload: &Value) -> Result<ApiResponse, ProviderError> {
-        Ok(self.api_client.api_post(&self.base_path, payload).await?)
-    }
-
-    fn openai_api_call_result(response: ApiResponse) -> Result<Value, ProviderError> {
-        match response.status {
-            StatusCode::OK => response.payload.ok_or_else(|| {
-                ProviderError::RequestFailed("Response body is not valid JSON".to_string())
-            }),
-            _ => Err(map_http_error_to_provider_error(
-                response.status,
-                response.payload,
-            )),
-        }
+    async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
+        let response = self
+            .api_client
+            .response_post(&self.base_path, payload)
+            .await?;
+        handle_response_openai_compat(response).await
     }
 }
 
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn metadata() -> ProviderMetadata {
+        let models = OPEN_AI_KNOWN_MODELS
+            .iter()
+            .map(|(name, limit)| ModelInfo::new(name, *limit))
+            .collect();
         ProviderMetadata::with_models(
             "openai",
             "OpenAI",
             "GPT-4 and other OpenAI models, including OpenAI compatible ones",
             OPEN_AI_DEFAULT_MODEL,
-            vec![
-                ModelInfo::new("gpt-4o", 128000),
-                ModelInfo::new("gpt-4o-mini", 128000),
-                ModelInfo::new("gpt-4-turbo", 128000),
-                ModelInfo::new("gpt-3.5-turbo", 16385),
-                ModelInfo::new("o1", 200000),
-                ModelInfo::new("o3", 200000),
-                ModelInfo::new("o4-mini", 128000),
-            ],
+            models,
             OPEN_AI_DOC_URL,
             vec![
                 ConfigKey::new("OPENAI_API_KEY", true, true, None),
@@ -166,8 +157,7 @@ impl Provider for OpenAiProvider {
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let payload = create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi)?;
 
-        let response = self.post(&payload).await?;
-        let json_response = Self::openai_api_call_result(response)?;
+        let json_response = self.post(&payload).await?;
 
         let message = response_to_message(&json_response)?;
         let usage = json_response
@@ -184,16 +174,8 @@ impl Provider for OpenAiProvider {
 
     async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
         let models_path = self.base_path.replace("v1/chat/completions", "v1/models");
-        let response = self.api_client.api_get(&models_path).await?;
-
-        if response.status != StatusCode::OK {
-            return Err(map_http_error_to_provider_error(
-                response.status,
-                response.payload,
-            ));
-        }
-
-        let json = response.payload.unwrap_or_default();
+        let response = self.api_client.response_get(&models_path).await?;
+        let json = handle_response_openai_compat(response).await?;
         if let Some(err_obj) = json.get("error") {
             let msg = err_obj
                 .get("message")
@@ -244,16 +226,12 @@ impl Provider for OpenAiProvider {
             .api_client
             .response_post(&self.base_path, &payload)
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            let error_json = serde_json::from_str::<Value>(&error_text).ok();
-            return Err(map_http_error_to_provider_error(status, error_json));
-        }
+        let response = handle_status_openai_compat(response).await?;
 
         let stream = response.bytes_stream().map_err(io::Error::other);
 
         let model_config = self.model.clone();
+
         Ok(Box::pin(try_stream! {
             let stream_reader = StreamReader::new(stream);
             let framed = FramedRead::new(stream_reader, LinesCodec::new()).map_err(anyhow::Error::from);
