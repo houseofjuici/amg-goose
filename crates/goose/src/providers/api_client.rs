@@ -5,6 +5,7 @@ use reqwest::{
     Client, Response, StatusCode,
 };
 use serde_json::Value;
+use std::fmt;
 use std::time::Duration;
 
 pub struct ApiClient {
@@ -37,6 +38,21 @@ pub trait AuthProvider: Send + Sync {
 pub struct ApiResponse {
     pub status: StatusCode,
     pub payload: Option<Value>,
+}
+
+impl fmt::Debug for AuthMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuthMethod::BearerToken(_) => f.debug_tuple("BearerToken").field(&"[hidden]").finish(),
+            AuthMethod::ApiKey { header_name, .. } => f
+                .debug_struct("ApiKey")
+                .field("header_name", header_name)
+                .field("key", &"[hidden]")
+                .finish(),
+            AuthMethod::OAuth(_) => f.debug_tuple("OAuth").field(&"[config]").finish(),
+            AuthMethod::Custom(_) => f.debug_tuple("Custom").field(&"[provider]").finish(),
+        }
+    }
 }
 
 impl ApiResponse {
@@ -189,5 +205,16 @@ impl<'a> ApiRequestBuilder<'a> {
         };
 
         Ok(request)
+    }
+}
+
+impl fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiClient")
+            .field("host", &self.host)
+            .field("auth", &"[auth method]")
+            .field("timeout", &self.timeout)
+            .field("default_headers", &self.default_headers)
+            .finish_non_exhaustive()
     }
 }

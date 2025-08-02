@@ -2,27 +2,26 @@ use anyhow::Result;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use reqwest::{Client, Response};
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io;
-use std::time::Duration;
 use tokio::pin;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
+use super::api_client::{ApiClient, ApiResponse, AuthMethod};
 use super::base::{ConfigKey, ModelInfo, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::embedding::{EmbeddingCapable, EmbeddingRequest, EmbeddingResponse};
 use super::errors::ProviderError;
 use super::formats::openai::{create_request, get_usage, response_to_message};
-use super::utils::{emit_debug_trace, get_model, handle_response_openai_compat, ImageFormat};
+use super::utils::{emit_debug_trace, get_model, map_http_error_to_provider_error, ImageFormat};
 use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::base::MessageStream;
 use crate::providers::formats::openai::response_to_streaming_message;
-use crate::providers::utils::handle_status_openai_compat;
 use rmcp::model::Tool;
 
 pub const OPEN_AI_DEFAULT_MODEL: &str = "gpt-4o";
@@ -43,10 +42,8 @@ pub const OPEN_AI_DOC_URL: &str = "https://platform.openai.com/docs/models";
 #[derive(Debug, serde::Serialize)]
 pub struct OpenAiProvider {
     #[serde(skip)]
-    client: Client,
-    host: String,
+    api_client: ApiClient,
     base_path: String,
-    api_key: String,
     organization: Option<String>,
     project: Option<String>,
     model: ModelConfig,
@@ -73,15 +70,32 @@ impl OpenAiProvider {
             .ok()
             .map(parse_custom_headers);
         let timeout_secs: u64 = config.get_param("OPENAI_TIMEOUT").unwrap_or(600);
-        let client = Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()?;
+
+        let auth = AuthMethod::BearerToken(api_key);
+        let mut api_client =
+            ApiClient::with_timeout(host, auth, std::time::Duration::from_secs(timeout_secs))?;
+
+        if let Some(org) = &organization {
+            api_client = api_client.with_header("OpenAI-Organization", org)?;
+        }
+
+        if let Some(project) = &project {
+            api_client = api_client.with_header("OpenAI-Project", project)?;
+        }
+
+        if let Some(headers) = &custom_headers {
+            let mut header_map = reqwest::header::HeaderMap::new();
+            for (key, value) in headers {
+                let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())?;
+                let header_value = reqwest::header::HeaderValue::from_str(value)?;
+                header_map.insert(header_name, header_value);
+            }
+            api_client = api_client.with_headers(header_map)?;
+        }
 
         Ok(Self {
-            client,
-            host,
+            api_client,
             base_path,
-            api_key,
             organization,
             project,
             model,
@@ -89,43 +103,20 @@ impl OpenAiProvider {
         })
     }
 
-    /// Helper function to add OpenAI-specific headers to a request
-    fn add_headers(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        // Add organization header if present
-        if let Some(org) = &self.organization {
-            request = request.header("OpenAI-Organization", org);
-        }
-
-        // Add project header if present
-        if let Some(project) = &self.project {
-            request = request.header("OpenAI-Project", project);
-        }
-
-        // Add custom headers if present
-        if let Some(custom_headers) = &self.custom_headers {
-            for (key, value) in custom_headers {
-                request = request.header(key, value);
-            }
-        }
-
-        request
+    async fn post(&self, payload: &Value) -> Result<ApiResponse, ProviderError> {
+        Ok(self.api_client.api_post(&self.base_path, payload).await?)
     }
 
-    async fn post(&self, payload: &Value) -> Result<Response, ProviderError> {
-        let base_url = url::Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let url = base_url.join(&self.base_path).map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
-        })?;
-
-        let request = self
-            .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key));
-
-        let request = self.add_headers(request);
-
-        Ok(request.json(&payload).send().await?)
+    fn openai_api_call_result(response: ApiResponse) -> Result<Value, ProviderError> {
+        match response.status {
+            StatusCode::OK => response.payload.ok_or_else(|| {
+                ProviderError::RequestFailed("Response body is not valid JSON".to_string())
+            }),
+            _ => Err(map_http_error_to_provider_error(
+                response.status,
+                response.payload,
+            )),
+        }
     }
 }
 
@@ -175,42 +166,34 @@ impl Provider for OpenAiProvider {
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let payload = create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi)?;
 
-        // Make request
-        let response = handle_response_openai_compat(self.post(&payload).await?).await?;
+        let response = self.post(&payload).await?;
+        let json_response = Self::openai_api_call_result(response)?;
 
-        // Parse response
-        let message = response_to_message(&response)?;
-        let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
-            tracing::debug!("Failed to get usage data");
-            Usage::default()
-        });
-        let model = get_model(&response);
-        emit_debug_trace(&self.model, &payload, &response, &usage);
+        let message = response_to_message(&json_response)?;
+        let usage = json_response
+            .get("usage")
+            .map(get_usage)
+            .unwrap_or_else(|| {
+                tracing::debug!("Failed to get usage data");
+                Usage::default()
+            });
+        let model = get_model(&json_response);
+        emit_debug_trace(&self.model, &payload, &json_response, &usage);
         Ok((message, ProviderUsage::new(model, usage)))
     }
 
-    /// Fetch supported models from OpenAI; returns Err on any failure, Ok(None) if no data
     async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
-        // List available models via OpenAI API
-        let base_url =
-            url::Url::parse(&self.host).map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-        let url = base_url
-            .join(&self.base_path.replace("v1/chat/completions", "v1/models"))
-            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-        let mut request = self.client.get(url).bearer_auth(&self.api_key);
-        if let Some(org) = &self.organization {
-            request = request.header("OpenAI-Organization", org);
+        let models_path = self.base_path.replace("v1/chat/completions", "v1/models");
+        let response = self.api_client.api_get(&models_path).await?;
+
+        if response.status != StatusCode::OK {
+            return Err(map_http_error_to_provider_error(
+                response.status,
+                response.payload,
+            ));
         }
-        if let Some(project) = &self.project {
-            request = request.header("OpenAI-Project", project);
-        }
-        if let Some(headers) = &self.custom_headers {
-            for (key, value) in headers {
-                request = request.header(key, value);
-            }
-        }
-        let response = request.send().await?;
-        let json: serde_json::Value = response.json().await?;
+
+        let json = response.payload.unwrap_or_default();
         if let Some(err_obj) = json.get("error") {
             let msg = err_obj
                 .get("message")
@@ -218,6 +201,7 @@ impl Provider for OpenAiProvider {
                 .unwrap_or("unknown error");
             return Err(ProviderError::Authentication(msg.to_string()));
         }
+
         let data = json.get("data").and_then(|v| v.as_array()).ok_or_else(|| {
             ProviderError::UsageError("Missing data field in JSON response".into())
         })?;
@@ -256,12 +240,20 @@ impl Provider for OpenAiProvider {
             "include_usage": true,
         });
 
-        let response = handle_status_openai_compat(self.post(&payload).await?).await?;
+        let response = self
+            .api_client
+            .response_post(&self.base_path, &payload)
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            let error_json = serde_json::from_str::<Value>(&error_text).ok();
+            return Err(map_http_error_to_provider_error(status, error_json));
+        }
 
         let stream = response.bytes_stream().map_err(io::Error::other);
 
         let model_config = self.model.clone();
-        // Wrap in a line decoder and yield lines inside the stream
         Ok(Box::pin(try_stream! {
             let stream_reader = StreamReader::new(stream);
             let framed = FramedRead::new(stream_reader, LinesCodec::new()).map_err(anyhow::Error::from);
@@ -295,7 +287,6 @@ impl EmbeddingCapable for OpenAiProvider {
             return Ok(vec![]);
         }
 
-        // Get embedding model from env var or use default
         let embedding_model = std::env::var("GOOSE_EMBEDDING_MODEL")
             .unwrap_or_else(|_| "text-embedding-3-small".to_string());
 
@@ -304,35 +295,25 @@ impl EmbeddingCapable for OpenAiProvider {
             model: embedding_model,
         };
 
-        // Construct embeddings endpoint URL
-        let base_url =
-            url::Url::parse(&self.host).map_err(|e| anyhow::anyhow!("Invalid base URL: {e}"))?;
-        let url = base_url
-            .join("v1/embeddings")
-            .map_err(|e| anyhow::anyhow!("Failed to construct embeddings URL: {e}"))?;
+        let response = self
+            .api_client
+            .api_post("v1/embeddings", &serde_json::to_value(request)?)
+            .await?;
 
-        let req = self
-            .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&request);
-
-        let req = self.add_headers(req);
-
-        let response = req
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send embedding request: {e}"))?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+        if response.status != StatusCode::OK {
+            let error_text = response
+                .payload
+                .as_ref()
+                .and_then(|p| p.as_str())
+                .unwrap_or("Unknown error");
             return Err(anyhow::anyhow!("Embedding API error: {}", error_text));
         }
 
-        let embedding_response: EmbeddingResponse = response
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse embedding response: {e}"))?;
+        let embedding_response: EmbeddingResponse = serde_json::from_value(
+            response
+                .payload
+                .ok_or_else(|| anyhow::anyhow!("Empty response body"))?,
+        )?;
 
         Ok(embedding_response
             .data
