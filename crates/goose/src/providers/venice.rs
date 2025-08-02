@@ -10,10 +10,11 @@ use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
 use super::retry::ProviderRetry;
 use super::utils::map_http_error_to_provider_error;
+use crate::impl_provider_default;
 use crate::message::{Message, MessageContent};
 use crate::model::ModelConfig;
-use mcp_core::{tool::Tool, ToolCall, ToolResult};
-use rmcp::model::Role;
+use mcp_core::{ToolCall, ToolResult};
+use rmcp::model::{Role, Tool};
 
 // ---------- Capability Flags ----------
 #[derive(Debug)]
@@ -82,12 +83,7 @@ pub struct VeniceProvider {
     model: ModelConfig,
 }
 
-impl Default for VeniceProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(VENICE_DEFAULT_MODEL.to_string());
-        VeniceProvider::from_env(model).expect("Failed to initialize Venice provider")
-    }
-}
+impl_provider_default!(VeniceProvider);
 
 impl VeniceProvider {
     pub fn from_env(mut model: ModelConfig) -> Result<Self> {

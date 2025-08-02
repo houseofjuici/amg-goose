@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use rmcp::model::Role;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -11,10 +12,10 @@ use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
 use super::utils::emit_debug_trace;
 use crate::config::Config;
+use crate::impl_provider_default;
 use crate::message::{Message, MessageContent};
 use crate::model::ModelConfig;
-use mcp_core::tool::Tool;
-use mcp_core::Role;
+use rmcp::model::Tool;
 
 pub const CLAUDE_CODE_DEFAULT_MODEL: &str = "claude-3-5-sonnet-latest";
 pub const CLAUDE_CODE_KNOWN_MODELS: &[&str] = &["sonnet", "opus", "claude-3-5-sonnet-latest"];
@@ -27,12 +28,7 @@ pub struct ClaudeCodeProvider {
     model: ModelConfig,
 }
 
-impl Default for ClaudeCodeProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(ClaudeCodeProvider::metadata().default_model);
-        ClaudeCodeProvider::from_env(model).expect("Failed to initialize Claude Code provider")
-    }
-}
+impl_provider_default!(ClaudeCodeProvider);
 
 impl ClaudeCodeProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -333,12 +329,14 @@ impl ClaudeCodeProvider {
         cmd.arg("-p")
             .arg(messages_json.to_string())
             .arg("--system-prompt")
-            .arg(&filtered_system)
-            .arg("--model")
-            .arg(&self.model.model_name)
-            .arg("--verbose")
-            .arg("--output-format")
-            .arg("json");
+            .arg(&filtered_system);
+
+        // Only pass model parameter if it's in the known models list
+        if CLAUDE_CODE_KNOWN_MODELS.contains(&self.model.model_name.as_str()) {
+            cmd.arg("--model").arg(&self.model.model_name);
+        }
+
+        cmd.arg("--verbose").arg("--output-format").arg("json");
 
         // Add permission mode based on GOOSE_MODE setting
         let config = Config::global();
@@ -352,7 +350,11 @@ impl ClaudeCodeProvider {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| ProviderError::RequestFailed(format!("Failed to spawn command: {}", e)))?;
+            .map_err(|e| ProviderError::RequestFailed(format!(
+                "Failed to spawn Claude CLI command '{}': {}. \
+                Make sure the Claude Code CLI is installed and in your PATH, or set CLAUDE_CODE_COMMAND in your config to the correct path.",
+                self.command, e
+            )))?;
 
         let stdout = child
             .stdout
@@ -409,7 +411,7 @@ impl ClaudeCodeProvider {
         // Extract the first user message text
         let description = messages
             .iter()
-            .find(|m| m.role == mcp_core::Role::User)
+            .find(|m| m.role == Role::User)
             .and_then(|m| {
                 m.content.iter().find_map(|c| match c {
                     MessageContent::Text(text_content) => Some(&text_content.text),
@@ -434,7 +436,7 @@ impl ClaudeCodeProvider {
 
         let message = Message {
             id: None,
-            role: mcp_core::Role::Assistant,
+            role: Role::Assistant,
             created: chrono::Utc::now().timestamp(),
             content: vec![MessageContent::text(description.clone())],
         };
@@ -515,6 +517,7 @@ impl Provider for ClaudeCodeProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::ModelConfig;
     use super::*;
 
     #[test]
@@ -537,5 +540,25 @@ mod tests {
         assert_eq!(goose_mode, "auto");
 
         std::env::remove_var("GOOSE_MODE");
+    }
+
+    #[test]
+    fn test_claude_code_invalid_model_no_fallback() {
+        // Test that an invalid model is kept as-is (no fallback)
+        let invalid_model = ModelConfig::new_or_fail("invalid-model");
+        let provider = ClaudeCodeProvider::from_env(invalid_model).unwrap();
+        let config = provider.get_model_config();
+
+        assert_eq!(config.model_name, "invalid-model");
+    }
+
+    #[test]
+    fn test_claude_code_valid_model() {
+        // Test that a valid model is preserved
+        let valid_model = ModelConfig::new_or_fail("sonnet");
+        let provider = ClaudeCodeProvider::from_env(valid_model).unwrap();
+        let config = provider.get_model_config();
+
+        assert_eq!(config.model_name, "sonnet");
     }
 }

@@ -25,6 +25,7 @@ pub mod pricing;
 mod retry;
 pub mod sagemaker_tgi;
 pub mod snowflake;
+pub mod testprovider;
 pub mod toolshim;
 pub mod utils;
 pub mod utils_universal_openai_stream;

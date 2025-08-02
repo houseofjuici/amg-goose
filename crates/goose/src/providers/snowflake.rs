@@ -11,9 +11,10 @@ use super::formats::snowflake::{create_request, get_usage, response_to_message};
 use super::retry::ProviderRetry;
 use super::utils::{get_model, map_http_error_to_provider_error, ImageFormat};
 use crate::config::ConfigError;
+use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 use url::Url;
 
 pub const SNOWFLAKE_DEFAULT_MODEL: &str = "claude-3-7-sonnet";
@@ -43,12 +44,7 @@ pub struct SnowflakeProvider {
     image_format: ImageFormat,
 }
 
-impl Default for SnowflakeProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(SnowflakeProvider::metadata().default_model);
-        SnowflakeProvider::from_env(model).expect("Failed to initialize Snowflake provider")
-    }
-}
+impl_provider_default!(SnowflakeProvider);
 
 impl SnowflakeProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -109,7 +105,7 @@ impl SnowflakeProvider {
         }
     }
 
-    async fn post(&self, payload: Value) -> Result<Value, ProviderError> {
+    async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
         let base_url_str =
             if !self.host.starts_with("https://") && !self.host.starts_with("http://") {
                 format!("https://{}", self.host)
@@ -341,10 +337,13 @@ impl Provider for SnowflakeProvider {
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let payload = create_request(&self.model, system, messages, tools)?;
 
-        let response = self.with_retry(|| self.post(payload.clone())).await?;
+        let response = self.with_retry(|| async {
+            let payload_clone = payload.clone();
+            self.post(&payload_clone).await
+        }).await?;
 
         // Parse response
-        let message = response_to_message(response.clone())?;
+        let message = response_to_message(&response)?;
         let usage = get_usage(&response)?;
         let model = get_model(&response);
         super::utils::emit_debug_trace(&self.model, &payload, &response, &usage);

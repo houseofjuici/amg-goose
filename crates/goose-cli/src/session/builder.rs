@@ -1,5 +1,6 @@
 use console::style;
 use goose::agents::extension::ExtensionError;
+use goose::agents::types::RetryConfig;
 use goose::agents::Agent;
 use goose::config::{Config, ExtensionConfig, ExtensionConfigManager};
 use goose::providers::create;
@@ -60,6 +61,8 @@ pub struct SessionBuilderConfig {
     pub sub_recipes: Option<Vec<SubRecipe>>,
     /// Final output expected response
     pub final_output_response: Option<Response>,
+    /// Retry configuration for automated validation and recovery
+    pub retry_config: Option<RetryConfig>,
 }
 
 /// Offers to help debug an extension failure by creating a minimal debugging session
@@ -138,6 +141,7 @@ async fn offer_extension_debugging_help(
         None,
         None,
         None,
+        None,
     );
 
     // Process the debugging request
@@ -198,8 +202,12 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> Session {
 
     let temperature = session_config.settings.as_ref().and_then(|s| s.temperature);
 
-    let model_config =
-        goose::model::ModelConfig::new(model_name.clone()).with_temperature(temperature);
+    let model_config = goose::model::ModelConfig::new(&model_name)
+        .unwrap_or_else(|e| {
+            output::render_error(&format!("Failed to create model configuration: {}", e));
+            process::exit(1);
+        })
+        .with_temperature(temperature);
 
     // Create the agent
     let agent: Agent = Agent::new();
@@ -338,6 +346,7 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> Session {
     // Extensions need to be added after the session is created because we change directory when resuming a session
     // If we get extensions_override, only run those extensions and none other
     let extensions_to_run: Vec<_> = if let Some(extensions) = session_config.extensions_override {
+        agent.disable_router_for_recipe().await;
         extensions.into_iter().collect()
     } else {
         ExtensionConfigManager::get_all()
@@ -407,6 +416,7 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> Session {
         session_config.scheduled_job_id.clone(),
         session_config.max_turns,
         edit_mode,
+        session_config.retry_config.clone(),
     );
 
     // Add extensions if provided
@@ -602,6 +612,7 @@ mod tests {
             quiet: false,
             sub_recipes: None,
             final_output_response: None,
+            retry_config: None,
         };
 
         assert_eq!(config.extensions.len(), 1);

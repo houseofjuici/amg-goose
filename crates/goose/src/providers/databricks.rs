@@ -19,6 +19,7 @@ use super::retry::ProviderRetry;
 
 use super::utils::{get_model, map_http_error_to_provider_error, ImageFormat};
 use crate::config::ConfigError;
+use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::formats::openai::{get_usage, response_to_streaming_message};
@@ -26,7 +27,7 @@ use crate::providers::retry::{
     RetryConfig, DEFAULT_BACKOFF_MULTIPLIER, DEFAULT_INITIAL_RETRY_INTERVAL_MS,
     DEFAULT_MAX_RETRIES, DEFAULT_MAX_RETRY_INTERVAL_MS,
 };
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 use serde_json::json;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -91,12 +92,7 @@ pub struct DatabricksProvider {
     retry_config: RetryConfig,
 }
 
-impl Default for DatabricksProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(DatabricksProvider::metadata().default_model);
-        DatabricksProvider::from_env(model).expect("Failed to initialize Databricks provider")
-    }
-}
+impl_provider_default!(DatabricksProvider);
 
 impl DatabricksProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -224,6 +220,7 @@ impl DatabricksProvider {
     }
 
     async fn post_response(&self, payload: Value) -> Result<reqwest::Response, ProviderError> {
+        // Check if this is an embedding request by looking at the payload structure
         let is_embedding = payload.get("input").is_some() && payload.get("messages").is_none();
         let path = if is_embedding {
             format!("serving-endpoints/{}/invocations", "text-embedding-3-small")
@@ -343,7 +340,7 @@ impl Provider for DatabricksProvider {
         let response = self.with_retry(|| self.post(payload.clone())).await?;
 
         // Parse response
-        let message = response_to_message(response.clone())?;
+        let message = response_to_message(&response)?;
         let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
             tracing::debug!("Failed to get usage data");
             Usage::default()
@@ -506,6 +503,7 @@ impl EmbeddingCapable for DatabricksProvider {
         });
 
         let response = self.with_retry(|| self.post(request.clone())).await?;
+
         let embeddings = response["data"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("Invalid response format: missing data array"))?

@@ -1,14 +1,15 @@
 use super::errors::ProviderError;
 use super::retry::ProviderRetry;
 use super::utils::{get_model, handle_response_openai_compat};
+use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use crate::providers::formats::openai::{create_request, get_usage, response_to_message};
 use anyhow::Result;
 use async_trait::async_trait;
-use mcp_core::Tool;
 use reqwest::Client;
+use rmcp::model::Tool;
 use serde_json::Value;
 use std::time::Duration;
 use url::Url;
@@ -46,12 +47,7 @@ pub struct XaiProvider {
     model: ModelConfig,
 }
 
-impl Default for XaiProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(XaiProvider::metadata().default_model);
-        XaiProvider::from_env(model).expect("Failed to initialize xAI provider")
-    }
-}
+impl_provider_default!(XaiProvider);
 
 impl XaiProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -142,7 +138,7 @@ impl Provider for XaiProvider {
 
         let response = self.with_retry(|| self.post(payload.clone())).await?;
 
-        let message = response_to_message(response.clone())?;
+        let message = response_to_message(&response)?;
         let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
             tracing::debug!("Failed to get usage data");
             Usage::default()

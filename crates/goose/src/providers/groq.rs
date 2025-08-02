@@ -1,21 +1,27 @@
 use super::errors::ProviderError;
 use super::retry::ProviderRetry;
 use super::utils::{get_model, handle_response_openai_compat};
+use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use crate::providers::formats::openai::{create_request, get_usage, response_to_message};
 use anyhow::Result;
 use async_trait::async_trait;
-use mcp_core::Tool;
 use reqwest::Client;
+use rmcp::model::Tool;
 use serde_json::Value;
 use std::time::Duration;
 use url::Url;
 
 pub const GROQ_API_HOST: &str = "https://api.groq.com";
-pub const GROQ_DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
-pub const GROQ_KNOWN_MODELS: &[&str] = &["gemma2-9b-it", "llama-3.3-70b-versatile"];
+pub const GROQ_DEFAULT_MODEL: &str = "moonshotai/kimi-k2-instruct";
+pub const GROQ_KNOWN_MODELS: &[&str] = &[
+    "gemma2-9b-it",
+    "llama-3.3-70b-versatile",
+    "moonshotai/kimi-k2-instruct",
+    "qwen/qwen3-32b",
+];
 
 pub const GROQ_DOC_URL: &str = "https://console.groq.com/docs/models";
 
@@ -28,12 +34,7 @@ pub struct GroqProvider {
     model: ModelConfig,
 }
 
-impl Default for GroqProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(GroqProvider::metadata().default_model);
-        GroqProvider::from_env(model).expect("Failed to initialize Groq provider")
-    }
-}
+impl_provider_default!(GroqProvider);
 
 impl GroqProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -115,7 +116,7 @@ impl Provider for GroqProvider {
 
         let response = self.with_retry(|| self.post(payload.clone())).await?;
 
-        let message = response_to_message(response.clone())?;
+        let message = response_to_message(&response)?;
         let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
             tracing::debug!("Failed to get usage data");
             Usage::default()

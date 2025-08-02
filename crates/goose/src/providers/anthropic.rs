@@ -17,16 +17,17 @@ use super::formats::anthropic::{
     create_request, get_usage, response_to_message, response_to_streaming_message,
 };
 use super::utils::{emit_debug_trace, get_model, map_http_error_to_provider_error};
+use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::retry::ProviderRetry;
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-3-5-sonnet-latest";
 pub const ANTHROPIC_KNOWN_MODELS: &[&str] = &[
-    "claude-sonnet-4-latest",
+    "claude-sonnet-4-0",
     "claude-sonnet-4-20250514",
-    "claude-opus-4-latest",
+    "claude-opus-4-0",
     "claude-opus-4-20250514",
     "claude-3-7-sonnet-latest",
     "claude-3-7-sonnet-20250219",
@@ -47,12 +48,7 @@ pub struct AnthropicProvider {
     model: ModelConfig,
 }
 
-impl Default for AnthropicProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(AnthropicProvider::metadata().default_model);
-        AnthropicProvider::from_env(model).expect("Failed to initialize Anthropic provider")
-    }
-}
+impl_provider_default!(AnthropicProvider);
 
 impl AnthropicProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -74,7 +70,7 @@ impl AnthropicProvider {
         })
     }
 
-    async fn post(&self, headers: HeaderMap, payload: Value) -> Result<Value, ProviderError> {
+    async fn post(&self, headers: HeaderMap, payload: &Value) -> Result<Value, ProviderError> {
         let base_url = url::Url::parse(&self.host)
             .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
         let url = base_url.join("v1/messages").map_err(|e| {
@@ -85,7 +81,7 @@ impl AnthropicProvider {
             .client
             .post(url)
             .headers(headers)
-            .json(&payload)
+            .json(payload)
             .send()
             .await?;
 
@@ -134,9 +130,9 @@ impl Provider for AnthropicProvider {
             "Claude and other models from Anthropic",
             ANTHROPIC_DEFAULT_MODEL,
             vec![
-                ModelInfo::new("claude-sonnet-4-latest", 200000),
+                ModelInfo::new("claude-sonnet-4-0", 200000),
                 ModelInfo::new("claude-sonnet-4-20250514", 200000),
-                ModelInfo::new("claude-opus-4-latest", 200000),
+                ModelInfo::new("claude-opus-4-0", 200000),
                 ModelInfo::new("claude-opus-4-20250514", 200000),
                 ModelInfo::new("claude-3-7-sonnet-latest", 200000),
                 ModelInfo::new("claude-3-7-sonnet-20250219", 200000),
@@ -194,10 +190,14 @@ impl Provider for AnthropicProvider {
         }
 
         let response = self
-            .with_retry(|| self.post(headers.clone(), payload.clone()))
+            .with_retry(|| async {
+                let headers_clone = headers.clone();
+                let payload_clone = payload.clone();
+                self.post(headers_clone, &payload_clone).await
+            })
             .await?;
 
-        let message = response_to_message(response.clone())?;
+        let message = response_to_message(&response.clone())?;
         let usage = get_usage(&response)?;
         tracing::debug!("🔍 Anthropic non-streaming parsed usage: input_tokens={:?}, output_tokens={:?}, total_tokens={:?}", 
                 usage.input_tokens, usage.output_tokens, usage.total_tokens);

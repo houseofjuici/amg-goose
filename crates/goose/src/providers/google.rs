@@ -1,6 +1,7 @@
 use super::errors::ProviderError;
 use super::retry::ProviderRetry;
 use super::utils::{emit_debug_trace, handle_response_google_compat, unescape_json_values};
+use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage};
@@ -8,8 +9,8 @@ use crate::providers::formats::google::{create_request, get_usage, response_to_m
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::http::HeaderMap;
-use mcp_core::tool::Tool;
 use reqwest::Client;
+use rmcp::model::Tool;
 use serde_json::Value;
 use std::time::Duration;
 use url::Url;
@@ -54,12 +55,7 @@ pub struct GoogleProvider {
     model: ModelConfig,
 }
 
-impl Default for GoogleProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(GoogleProvider::metadata().default_model);
-        GoogleProvider::from_env(model).expect("Failed to initialize Google provider")
-    }
-}
+impl_provider_default!(GoogleProvider);
 
 impl GoogleProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -85,7 +81,7 @@ impl GoogleProvider {
         })
     }
 
-    async fn post(&self, payload: Value) -> Result<Value, ProviderError> {
+    async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
         let base_url = Url::parse(&self.host)
             .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
 
@@ -143,7 +139,10 @@ impl Provider for GoogleProvider {
         let payload = create_request(&self.model, system, messages, tools)?;
 
         // Make request
-        let response = self.with_retry(|| self.post(payload.clone())).await?;
+        let response = self.with_retry(|| async {
+            let payload_clone = payload.clone();
+            self.post(&payload_clone).await
+        }).await?;
 
         // Parse response
         let message = response_to_message(unescape_json_values(&response))?;

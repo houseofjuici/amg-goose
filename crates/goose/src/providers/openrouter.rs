@@ -11,10 +11,11 @@ use super::utils::{
     emit_debug_trace, get_model, handle_response_google_compat, handle_response_openai_compat,
     is_google_model,
 };
+use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::formats::openai::{create_request, get_usage, response_to_message};
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 use url::Url;
 
 pub const OPENROUTER_DEFAULT_MODEL: &str = "anthropic/claude-3.5-sonnet";
@@ -27,6 +28,8 @@ pub const OPENROUTER_KNOWN_MODELS: &[&str] = &[
     "anthropic/claude-sonnet-4",
     "google/gemini-2.5-pro",
     "deepseek/deepseek-r1-0528",
+    "qwen/qwen3-coder",
+    "moonshotai/kimi-k2",
 ];
 pub const OPENROUTER_DOC_URL: &str = "https://openrouter.ai/models";
 
@@ -39,12 +42,7 @@ pub struct OpenRouterProvider {
     model: ModelConfig,
 }
 
-impl Default for OpenRouterProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(OpenRouterProvider::metadata().default_model);
-        OpenRouterProvider::from_env(model).expect("Failed to initialize OpenRouter provider")
-    }
-}
+impl_provider_default!(OpenRouterProvider);
 
 impl OpenRouterProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
@@ -66,7 +64,7 @@ impl OpenRouterProvider {
         })
     }
 
-    async fn post(&self, payload: Value) -> Result<Value, ProviderError> {
+    async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
         let base_url = Url::parse(&self.host)
             .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
         let url = base_url.join("api/v1/chat/completions").map_err(|e| {
@@ -80,12 +78,12 @@ impl OpenRouterProvider {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("HTTP-Referer", "https://block.github.io/goose")
             .header("X-Title", "Goose")
-            .json(&payload)
+            .json(payload)
             .send()
             .await?;
 
         // Handle Google-compatible model responses differently
-        if is_google_model(&payload) {
+        if is_google_model(payload) {
             return handle_response_google_compat(response).await;
         }
 
@@ -93,6 +91,13 @@ impl OpenRouterProvider {
         let response_body = handle_response_openai_compat(response)
             .await
             .map_err(|e| ProviderError::RequestFailed(format!("Failed to parse response: {e}")))?;
+
+        let _debug = format!(
+            "OpenRouter request with payload: {} and response: {}",
+            serde_json::to_string_pretty(payload).unwrap_or_else(|_| "Invalid JSON".to_string()),
+            serde_json::to_string_pretty(&response_body)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
+        );
 
         // OpenRouter can return errors in 200 OK responses, so we have to check for errors explicitly
         // https://openrouter.ai/docs/api-reference/errors
@@ -260,10 +265,13 @@ impl Provider for OpenRouterProvider {
         let payload = create_request_based_on_model(self, system, messages, tools)?;
 
         // Make request
-        let response = self.with_retry(|| self.post(payload.clone())).await?;
+        let response = self.with_retry(|| async {
+            let payload_clone = payload.clone();
+            self.post(&payload_clone).await
+        }).await?;
 
         // Parse response
-        let message = response_to_message(response.clone())?;
+        let message = response_to_message(&response)?;
         let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
             tracing::debug!("Failed to get usage data");
             Usage::default()
