@@ -120,7 +120,7 @@ impl Provider for OpenAiProvider {
     fn metadata() -> ProviderMetadata {
         let models = OPEN_AI_KNOWN_MODELS
             .iter()
-            .map(|(name, limit)| ModelInfo::new(name, *limit))
+            .map(|(name, limit)| ModelInfo::new(*name, *limit))
             .collect();
         ProviderMetadata::with_models(
             "openai",

@@ -2,7 +2,6 @@ use anyhow::Result;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io;
@@ -10,14 +9,14 @@ use std::time::Duration;
 use tokio::pin;
 use tokio_util::io::StreamReader;
 
+use super::api_client::{ApiClient, AuthMethod, AuthProvider};
 use super::base::{ConfigKey, MessageStream, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::embedding::EmbeddingCapable;
 use super::errors::ProviderError;
 use super::formats::databricks::{create_request, response_to_message};
 use super::oauth;
 use super::retry::ProviderRetry;
-
-use super::utils::{get_model, map_http_error_to_provider_error, ImageFormat};
+use super::utils::{get_model, handle_response_openai_compat, ImageFormat};
 use crate::config::ConfigError;
 use crate::impl_provider_default;
 use crate::message::Message;
@@ -31,19 +30,13 @@ use rmcp::model::Tool;
 use serde_json::json;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
-use url::Url;
 
 const DEFAULT_CLIENT_ID: &str = "databricks-cli";
 const DEFAULT_REDIRECT_URL: &str = "http://localhost:8020";
-// "offline_access" scope is used to request an OAuth 2.0 Refresh Token
-// https://openid.net/specs/openid-connect-core-1_0.html#OfflineAccess
 const DEFAULT_SCOPES: &[&str] = &["all-apis", "offline_access"];
-
-/// Default timeout for API requests in seconds
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 pub const DATABRICKS_DEFAULT_MODEL: &str = "databricks-claude-3-7-sonnet";
-// Databricks can pass through to a wide range of models, we only provide the default
 pub const DATABRICKS_KNOWN_MODELS: &[&str] = &[
     "databricks-meta-llama-3-3-70b-instruct",
     "databricks-meta-llama-3-1-405b-instruct",
@@ -66,7 +59,6 @@ pub enum DatabricksAuth {
 }
 
 impl DatabricksAuth {
-    /// Create a new OAuth configuration with default values
     pub fn oauth(host: String) -> Self {
         Self::OAuth {
             host,
@@ -75,16 +67,36 @@ impl DatabricksAuth {
             scopes: DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect(),
         }
     }
+
     pub fn token(token: String) -> Self {
         Self::Token(token)
+    }
+}
+
+struct DatabricksAuthProvider {
+    auth: DatabricksAuth,
+}
+
+#[async_trait]
+impl AuthProvider for DatabricksAuthProvider {
+    async fn get_auth_header(&self) -> Result<(String, String)> {
+        let token = match &self.auth {
+            DatabricksAuth::Token(token) => token.clone(),
+            DatabricksAuth::OAuth {
+                host,
+                client_id,
+                redirect_url,
+                scopes,
+            } => oauth::get_oauth_token_async(host, client_id, redirect_url, scopes).await?,
+        };
+        Ok(("Authorization".to_string(), format!("Bearer {}", token)))
     }
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct DatabricksProvider {
     #[serde(skip)]
-    client: Client,
-    host: String,
+    api_client: ApiClient,
     auth: DatabricksAuth,
     model: ModelConfig,
     image_format: ImageFormat,
@@ -98,8 +110,6 @@ impl DatabricksProvider {
     pub fn from_env(model: ModelConfig) -> Result<Self> {
         let config = crate::config::Config::global();
 
-        // For compatibility for now we check both config and secret for databricks host,
-        // but it is not actually a secret value
         let mut host: Result<String, ConfigError> = config.get_param("DATABRICKS_HOST");
         if host.is_err() {
             host = config.get_secret("DATABRICKS_HOST")
@@ -113,38 +123,29 @@ impl DatabricksProvider {
         }
 
         let host = host?;
-
-        let client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .build()?;
-
-        // Load optional retry configuration from environment
         let retry_config = Self::load_retry_config(config);
 
-        // If we find a databricks token we prefer that
-        if let Ok(api_key) = config.get_secret("DATABRICKS_TOKEN") {
-            return Ok(Self {
-                client,
-                host,
-                auth: DatabricksAuth::token(api_key),
-                model,
-                image_format: ImageFormat::OpenAi,
-                retry_config,
-            });
-        }
+        let auth = if let Ok(api_key) = config.get_secret("DATABRICKS_TOKEN") {
+            DatabricksAuth::token(api_key)
+        } else {
+            DatabricksAuth::oauth(host.clone())
+        };
 
-        // Otherwise use Oauth flow
+        let auth_method =
+            AuthMethod::Custom(Box::new(DatabricksAuthProvider { auth: auth.clone() }));
+
+        let api_client =
+            ApiClient::with_timeout(host, auth_method, Duration::from_secs(DEFAULT_TIMEOUT_SECS))?;
+
         Ok(Self {
-            client,
-            auth: DatabricksAuth::oauth(host.clone()),
-            host,
+            api_client,
+            auth,
             model,
             image_format: ImageFormat::OpenAi,
             retry_config,
         })
     }
 
-    /// Loads retry configuration from environment variables or uses defaults.
     fn load_retry_config(config: &crate::config::Config) -> RetryConfig {
         let max_retries = config
             .get_param("DATABRICKS_MAX_RETRIES")
@@ -178,120 +179,36 @@ impl DatabricksProvider {
         }
     }
 
-    /// Create a new DatabricksProvider with the specified host and token
-    ///
-    /// # Arguments
-    ///
-    /// * `host` - The Databricks host URL
-    /// * `token` - The Databricks API token
-    ///
-    /// # Returns
-    ///
-    /// Returns a Result containing the new DatabricksProvider instance
     pub fn from_params(host: String, api_key: String, model: ModelConfig) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let auth = DatabricksAuth::token(api_key);
+        let auth_method =
+            AuthMethod::Custom(Box::new(DatabricksAuthProvider { auth: auth.clone() }));
+
+        let api_client = ApiClient::with_timeout(host, auth_method, Duration::from_secs(600))?;
 
         Ok(Self {
-            client,
-            host,
-            auth: DatabricksAuth::token(api_key),
+            api_client,
+            auth,
             model,
             image_format: ImageFormat::OpenAi,
             retry_config: RetryConfig::default(),
         })
     }
 
-    async fn ensure_auth_header(&self) -> Result<String> {
-        match &self.auth {
-            DatabricksAuth::Token(token) => Ok(format!("Bearer {}", token)),
-            DatabricksAuth::OAuth {
-                host,
-                client_id,
-                redirect_url,
-                scopes,
-            } => {
-                let token =
-                    oauth::get_oauth_token_async(host, client_id, redirect_url, scopes).await?;
-                Ok(format!("Bearer {}", token))
-            }
-        }
-    }
-
-    async fn post_response(&self, payload: Value) -> Result<reqwest::Response, ProviderError> {
-        // Check if this is an embedding request by looking at the payload structure
-        let is_embedding = payload.get("input").is_some() && payload.get("messages").is_none();
-        let path = if is_embedding {
-            format!("serving-endpoints/{}/invocations", "text-embedding-3-small")
+    fn get_endpoint_path(&self, is_embedding: bool) -> String {
+        if is_embedding {
+            "serving-endpoints/text-embedding-3-small/invocations".to_string()
         } else {
             format!("serving-endpoints/{}/invocations", self.model.model_name)
-        };
-
-        let base_url = Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let url = base_url.join(&path).map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
-        })?;
-
-        let auth_header = self.ensure_auth_header().await?;
-        let response = self
-            .client
-            .post(url)
-            .header("Authorization", auth_header)
-            .json(&payload)
-            .send()
-            .await?;
-
-        let status = response.status();
-
-        match status {
-            StatusCode::OK => Ok(response),
-            StatusCode::BAD_REQUEST => {
-                let bytes = response.bytes().await?;
-                let payload_str = String::from_utf8_lossy(&bytes);
-
-                let error_msg = if let Ok(response_json) = serde_json::from_slice::<Value>(&bytes) {
-                    response_json
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .or_else(|| {
-                            response_json
-                                .get("external_model_message")
-                                .and_then(|ext| ext.get("message"))
-                                .and_then(|m| m.as_str())
-                        })
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                };
-
-                if let Some(msg) = error_msg {
-                    let error_json = json!({"error": {"message": msg}});
-                    Err(map_http_error_to_provider_error(status, Some(error_json)))
-                } else {
-                    Err(map_http_error_to_provider_error(
-                        status,
-                        serde_json::from_str(&payload_str).ok(),
-                    ))
-                }
-            }
-            _ => {
-                let error_text = response.text().await.unwrap_or_default();
-                Err(map_http_error_to_provider_error(
-                    status,
-                    serde_json::from_str(&error_text).ok(),
-                ))
-            }
         }
     }
 
     async fn post(&self, payload: Value) -> Result<Value, ProviderError> {
-        let response = self.post_response(payload).await?;
-        response
-            .json()
-            .await
-            .map_err(|_| ProviderError::RequestFailed("Invalid JSON".to_string()))
+        let is_embedding = payload.get("input").is_some() && payload.get("messages").is_none();
+        let path = self.get_endpoint_path(is_embedding);
+
+        let response = self.api_client.response_post(&path, &payload).await?;
+        handle_response_openai_compat(response).await
     }
 }
 
@@ -331,7 +248,6 @@ impl Provider for DatabricksProvider {
         tools: &[Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let mut payload = create_request(&self.model, system, messages, tools, &self.image_format)?;
-        // Remove the model key which is part of the url with databricks
         payload
             .as_object_mut()
             .expect("payload should have model key")
@@ -339,7 +255,6 @@ impl Provider for DatabricksProvider {
 
         let response = self.with_retry(|| self.post(payload.clone())).await?;
 
-        // Parse response
         let message = response_to_message(&response)?;
         let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
             tracing::debug!("Failed to get usage data");
@@ -358,7 +273,6 @@ impl Provider for DatabricksProvider {
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
         let mut payload = create_request(&self.model, system, messages, tools, &self.image_format)?;
-        // Remove the model key which is part of the url with databricks
         payload
             .as_object_mut()
             .expect("payload should have model key")
@@ -369,15 +283,24 @@ impl Provider for DatabricksProvider {
             .unwrap()
             .insert("stream".to_string(), Value::Bool(true));
 
+        let path = self.get_endpoint_path(false);
         let response = self
-            .with_retry(|| self.post_response(payload.clone()))
+            .with_retry(|| async {
+                let resp = self.api_client.response_post(&path, &payload).await?;
+                if !resp.status().is_success() {
+                    return Err(ProviderError::RequestFailed(format!(
+                        "HTTP {}: {}",
+                        resp.status(),
+                        resp.text().await.unwrap_or_default()
+                    )));
+                }
+                Ok(resp)
+            })
             .await?;
 
-        // Map request error to io::Error
         let stream = response.bytes_stream().map_err(io::Error::other);
-
         let model_config = self.model.clone();
-        // Wrap in a line decoder and yield lines inside the stream
+
         Ok(Box::pin(try_stream! {
             let stream_reader = StreamReader::new(stream);
             let framed = FramedRead::new(stream_reader, LinesCodec::new()).map_err(anyhow::Error::from);
@@ -407,31 +330,15 @@ impl Provider for DatabricksProvider {
     }
 
     async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
-        let base_url = Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let url = base_url.join("api/2.0/serving-endpoints").map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
-        })?;
-
-        let auth_header = match self.ensure_auth_header().await {
-            Ok(header) => header,
-            Err(e) => {
-                tracing::warn!("Failed to authorize with Databricks: {}", e);
-                return Ok(None); // Return None to fall back to manual input
-            }
-        };
-
         let response = match self
-            .client
-            .get(url)
-            .header("Authorization", auth_header)
-            .send()
+            .api_client
+            .response_get("api/2.0/serving-endpoints")
             .await
         {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("Failed to fetch Databricks models: {}", e);
-                return Ok(None); // Return None to fall back to manual input
+                return Ok(None);
             }
         };
 
@@ -446,7 +353,7 @@ impl Provider for DatabricksProvider {
             } else {
                 tracing::warn!("Failed to fetch Databricks models: {}", status);
             }
-            return Ok(None); // Return None to fall back to manual input
+            return Ok(None);
         }
 
         let json: Value = match response.json().await {
@@ -497,7 +404,6 @@ impl EmbeddingCapable for DatabricksProvider {
             return Ok(vec![]);
         }
 
-        // Create request in Databricks format for embeddings
         let request = json!({
             "input": texts,
         });
