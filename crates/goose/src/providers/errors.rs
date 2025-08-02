@@ -30,13 +30,17 @@ pub enum ProviderError {
 
 impl From<anyhow::Error> for ProviderError {
     fn from(error: anyhow::Error) -> Self {
+        // Try to get more specific error type if it's a reqwest error
+        if let Some(reqwest_err) = error.downcast_ref::<reqwest::Error>() {
+            return Self::from(reqwest_err.clone());
+        }
         ProviderError::ExecutionError(error.to_string())
     }
 }
 
 impl From<reqwest::Error> for ProviderError {
     fn from(error: reqwest::Error) -> Self {
-        ProviderError::ExecutionError(error.to_string())
+        ProviderError::RequestFailed(error.to_string())
     }
 }
 
