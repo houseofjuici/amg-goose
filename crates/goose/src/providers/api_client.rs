@@ -1,15 +1,18 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use reqwest::{header::HeaderMap, Client, Response, StatusCode};
+use reqwest::{
+    header::{HeaderMap, HeaderName, HeaderValue},
+    Client, Response, StatusCode,
+};
 use serde_json::Value;
 use std::time::Duration;
-use tokio_stream::StreamExt;
 
 pub struct ApiClient {
     client: Client,
     host: String,
     auth: AuthMethod,
     default_headers: HeaderMap,
+    timeout: Duration,
 }
 
 pub enum AuthMethod {
@@ -51,9 +54,8 @@ pub struct ApiRequestBuilder<'a> {
 }
 
 impl ApiClient {
-    pub fn new(host: String, auth: AuthMethod) -> Self {
+    pub fn new(host: String, auth: AuthMethod) -> Result<Self> {
         Self::with_timeout(host, auth, Duration::from_secs(600))
-            .expect("Default client creation should not fail")
     }
 
     pub fn with_timeout(host: String, auth: AuthMethod, timeout: Duration) -> Result<Self> {
@@ -62,30 +64,31 @@ impl ApiClient {
             host,
             auth,
             default_headers: HeaderMap::new(),
+            timeout,
         })
     }
 
     pub fn with_headers(mut self, headers: HeaderMap) -> Result<Self> {
-        let timeout = self.client.timeout();
         self.default_headers = headers;
         self.client = Client::builder()
-            .timeout(timeout)
+            .timeout(self.timeout)
             .default_headers(self.default_headers.clone())
             .build()?;
         Ok(self)
     }
 
     pub fn with_header(mut self, key: &str, value: &str) -> Result<Self> {
-        self.default_headers.insert(key.parse()?, value.parse()?);
-        let timeout = self.client.timeout();
+        let header_name = HeaderName::from_bytes(key.as_bytes())?;
+        let header_value = HeaderValue::from_str(value)?;
+        self.default_headers.insert(header_name, header_value);
         self.client = Client::builder()
-            .timeout(timeout)
+            .timeout(self.timeout)
             .default_headers(self.default_headers.clone())
             .build()?;
         Ok(self)
     }
 
-    pub fn request(&self, path: &str) -> ApiRequestBuilder {
+    pub fn request<'a>(&'a self, path: &'a str) -> ApiRequestBuilder<'a> {
         ApiRequestBuilder {
             client: self,
             path,
@@ -111,10 +114,8 @@ impl ApiClient {
 
     fn build_url(&self, path: &str) -> Result<url::Url> {
         use url::Url;
-
         let base_url =
             Url::parse(&self.host).map_err(|e| anyhow::anyhow!("Invalid base URL: {}", e))?;
-
         base_url
             .join(path)
             .map_err(|e| anyhow::anyhow!("Failed to construct URL: {}", e))
@@ -133,7 +134,9 @@ impl ApiClient {
 
 impl<'a> ApiRequestBuilder<'a> {
     pub fn header(mut self, key: &str, value: &str) -> Result<Self> {
-        self.headers.insert(key.parse()?, value.parse()?);
+        let header_name = HeaderName::from_bytes(key.as_bytes())?;
+        let header_value = HeaderValue::from_str(value)?;
+        self.headers.insert(header_name, header_value);
         Ok(self)
     }
 
@@ -148,10 +151,8 @@ impl<'a> ApiRequestBuilder<'a> {
     }
 
     pub async fn response_post(self, payload: &Value) -> Result<Response> {
-        let response = self
-            .send_request(|url| self.client.client.post(url))
-            .await?;
-        Ok(response.json(payload).send().await?)
+        let request = self.send_request(|url, client| client.post(url)).await?;
+        Ok(request.json(payload).send().await?)
     }
 
     pub async fn api_get(self) -> Result<ApiResponse> {
@@ -160,24 +161,23 @@ impl<'a> ApiRequestBuilder<'a> {
     }
 
     pub async fn response_get(self) -> Result<Response> {
-        let response = self.send_request(|url| self.client.client.get(url)).await?;
-        Ok(response.send().await?)
+        let request = self.send_request(|url, client| client.get(url)).await?;
+        Ok(request.send().await?)
     }
 
-    async fn send_request<F>(self, request_builder: F) -> Result<reqwest::RequestBuilder>
+    async fn send_request<F>(&self, request_builder: F) -> Result<reqwest::RequestBuilder>
     where
-        F: FnOnce(url::Url) -> reqwest::RequestBuilder,
+        F: FnOnce(url::Url, &Client) -> reqwest::RequestBuilder,
     {
         let url = self.client.build_url(self.path)?;
-
-        let mut request = request_builder(url);
-        request = request.headers(self.headers);
+        let mut request = request_builder(url, &self.client.client);
+        request = request.headers(self.headers.clone());
 
         request = match &self.client.auth {
             AuthMethod::BearerToken(token) => {
                 request.header("Authorization", format!("Bearer {}", token))
             }
-            AuthMethod::ApiKey { header_name, key } => request.header(header_name, key),
+            AuthMethod::ApiKey { header_name, key } => request.header(header_name.as_str(), key),
             AuthMethod::OAuth(config) => {
                 let token = self.client.get_oauth_token(config).await?;
                 request.header("Authorization", format!("Bearer {}", token))

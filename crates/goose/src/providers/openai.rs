@@ -30,6 +30,8 @@ pub const OPEN_AI_KNOWN_MODELS: &[&str] = &[
     "gpt-4o",
     "gpt-4o-mini",
     "gpt-4-turbo",
+    "gpt-4.1",
+    "gpt-4.1-mini",
     "gpt-3.5-turbo",
     "o1",
     "o3",

@@ -5,7 +5,6 @@ use futures::TryStreamExt;
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::io;
-use std::time::Duration;
 use tokio::pin;
 use tokio_util::io::StreamReader;
 
@@ -22,8 +21,8 @@ use crate::model::ModelConfig;
 use crate::providers::retry::ProviderRetry;
 use rmcp::model::Tool;
 
-pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-3-5-sonnet-latest";
-pub const ANTHROPIC_KNOWN_MODELS: &[&str] = &[
+const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-4-0";
+const ANTHROPIC_KNOWN_MODELS: &[&str] = &[
     "claude-sonnet-4-0",
     "claude-sonnet-4-20250514",
     "claude-opus-4-0",
@@ -35,8 +34,8 @@ pub const ANTHROPIC_KNOWN_MODELS: &[&str] = &[
     "claude-3-opus-latest",
 ];
 
-pub const ANTHROPIC_DOC_URL: &str = "https://docs.anthropic.com/en/docs/about-claude/models";
-pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const ANTHROPIC_DOC_URL: &str = "https://docs.anthropic.com/en/docs/about-claude/models";
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 #[derive(serde::Serialize)]
 pub struct AnthropicProvider {
@@ -124,24 +123,17 @@ impl AnthropicProvider {
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn metadata() -> ProviderMetadata {
+        let models: Vec<ModelInfo> = ANTHROPIC_KNOWN_MODELS
+            .iter()
+            .map(|&model_name| ModelInfo::new(model_name, 200_000))
+            .collect();
+
         ProviderMetadata::with_models(
             "anthropic",
             "Anthropic",
             "Claude and other models from Anthropic",
             ANTHROPIC_DEFAULT_MODEL,
-            vec![
-                ModelInfo::new("claude-sonnet-4-0", 200000),
-                ModelInfo::new("claude-sonnet-4-20250514", 200000),
-                ModelInfo::new("claude-opus-4-0", 200000),
-                ModelInfo::new("claude-opus-4-20250514", 200000),
-                ModelInfo::new("claude-3-7-sonnet-latest", 200000),
-                ModelInfo::new("claude-3-7-sonnet-20250219", 200000),
-                ModelInfo::new("claude-3-5-sonnet-20241022", 200000),
-                ModelInfo::new("claude-3-5-haiku-20241022", 200000),
-                ModelInfo::new("claude-3-opus-20240229", 200000),
-                ModelInfo::new("claude-3-sonnet-20240229", 200000),
-                ModelInfo::new("claude-3-haiku-20240307", 200000),
-            ],
+            models,
             ANTHROPIC_DOC_URL,
             vec![
                 ConfigKey::new("ANTHROPIC_API_KEY", true, true, None),
