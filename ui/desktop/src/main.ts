@@ -2161,30 +2161,9 @@ app.whenReady().then(async () => {
     event.returnValue = app.getVersion();
   });
 
-  // Handle opening directory in system file explorer
-  ipcMain.handle('open-directory-in-explorer', async (_event, directoryPath: string) => {
+  ipcMain.handle('open-directory-in-explorer', async (_event, path: string) => {
     try {
-      // Validate and expand the directory path
-      const expandedPath = expandTilde(directoryPath);
-      
-      // Check if the directory exists
-      const stats = await fs.stat(expandedPath);
-      if (!stats.isDirectory()) {
-        console.error('Path is not a directory:', expandedPath);
-        return false;
-      }
-
-      // Use shell.openPath to open the directory in the system file explorer
-      const result = await shell.openPath(expandedPath);
-      
-      // shell.openPath returns an empty string on success, or an error message on failure
-      if (result === '') {
-        console.log('Successfully opened directory in explorer:', expandedPath);
-        return true;
-      } else {
-        console.error('Failed to open directory in explorer:', result);
-        return false;
-      }
+      return !!(await shell.openPath(path));
     } catch (error) {
       console.error('Error opening directory in explorer:', error);
       return false;

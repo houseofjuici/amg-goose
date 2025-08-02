@@ -22,27 +22,15 @@ export const DirSwitcher: React.FC<DirSwitcherProps> = ({
   };
 
   const handleDirectoryClick = async (event: React.MouseEvent) => {
-    // Check for cmd-click (Mac) or ctrl-click (Windows/Linux)
     const isCmdOrCtrlClick = event.metaKey || event.ctrlKey;
-    
+
     if (isCmdOrCtrlClick) {
       event.preventDefault();
       event.stopPropagation();
-      
       const workingDir = window.appConfig.get('GOOSE_WORKING_DIR') as string;
-      if (workingDir) {
-        try {
-          const success = await window.electron.openDirectoryInExplorer(workingDir);
-          if (!success) {
-            console.error('Failed to open directory in explorer:', workingDir);
-          }
-        } catch (error) {
-          console.error('Error opening directory in explorer:', error);
-        }
-      }
+      await window.electron.openDirectoryInExplorer(workingDir);
     } else {
-      // Normal click behavior - change directory
-      handleDirectoryChange();
+      await handleDirectoryChange();
     }
   };
 
@@ -61,12 +49,7 @@ export const DirSwitcher: React.FC<DirSwitcherProps> = ({
           </button>
         </TooltipTrigger>
         <TooltipContent side="top">
-          <div className="text-center">
-            <div>{window.appConfig.get('GOOSE_WORKING_DIR') as string}</div>
-            <div className="text-xs text-text-subtle mt-1">
-              Click to change • {window.electron.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Click to open in {window.electron.platform === 'darwin' ? 'Finder' : 'Explorer'}
-            </div>
-          </div>
+          {window.appConfig.get('GOOSE_WORKING_DIR') as string}
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
