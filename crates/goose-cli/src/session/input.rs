@@ -41,7 +41,7 @@ impl rustyline::ConditionalEventHandler for CtrlCHandler {
     /// Handle Ctrl+C to clear the line if text is entered, otherwise exit the session.
     fn handle(
         &self,
-        event: &rustyline::Event,
+        _event: &rustyline::Event,
         _n: usize,
         _positive: bool,
         ctx: &rustyline::EventContext,
