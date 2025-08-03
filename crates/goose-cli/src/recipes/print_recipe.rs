@@ -1,27 +1,27 @@
 use std::collections::HashMap;
 
-use crate::g_println;
+use anstream::println;
 use console::style;
 use goose::recipe::{Recipe, BUILT_IN_RECIPE_DIR_PARAM};
 
 pub fn print_recipe_explanation(recipe: &Recipe) {
-    g_println!(
+    println!(
         "{} {}",
         style("🔍 Loading recipe:").bold().green(),
         style(&recipe.title).green()
     );
-    g_println!("{}", style("📄 Description:").bold());
-    g_println!("   {}", recipe.description);
+    println!("{}", style("📄 Description:").bold());
+    println!("   {}", recipe.description);
     if let Some(params) = &recipe.parameters {
         if !params.is_empty() {
-            g_println!("{}", style("⚙️  Recipe Parameters:").bold());
+            println!("{}", style("⚙️  Recipe Parameters:").bold());
             for param in params {
                 let default_display = match &param.default {
                     Some(val) => format!(" (default: {})", val),
                     None => String::new(),
                 };
 
-                g_println!(
+                println!(
                     "   - {} ({}, {}){}: {}",
                     style(&param.key).cyan(),
                     param.input_type,
@@ -41,7 +41,7 @@ pub fn print_parameters_with_values(params: HashMap<String, String>) {
         } else {
             ""
         };
-        g_println!("   {}{}: {}", key, label, value);
+        println!("   {}{}: {}", key, label, value);
     }
 }
 
@@ -50,26 +50,26 @@ pub fn print_required_parameters_for_template(
     missing_params: Vec<String>,
 ) {
     if !params_for_template.is_empty() {
-        g_println!(
+        println!(
             "{}",
             style("📥 Parameters used to load this recipe:").bold()
         );
         print_parameters_with_values(params_for_template)
     }
     if !missing_params.is_empty() {
-        g_println!(
+        println!(
             "{}",
             style("🔴 Missing parameters in the command line if you want to run the recipe:")
                 .bold()
         );
         for param in missing_params.iter() {
-            g_println!("   - {}", param);
+            println!("   - {}", param);
         }
-        g_println!(
+        println!(
             "📩 {}:",
             style("Please provide the following parameters in the command line if you want to run the recipe:").bold()
         );
-        g_println!("  {}", missing_parameters_command_line(missing_params));
+        println!("  {}", missing_parameters_command_line(missing_params));
     }
 }
 

@@ -3327,6 +3327,7 @@ dependencies = [
 name = "goose-cli"
 version = "1.1.0"
 dependencies = [
+ "anstream",
  "anyhow",
  "async-trait",
  "axum",

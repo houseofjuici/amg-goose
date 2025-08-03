@@ -1,3 +1,4 @@
+use anstream::println;
 use bat::WrappingMode;
 use console::{style, Color};
 use goose::config::Config;
@@ -15,21 +16,6 @@ use std::io::{Error, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-
-// g_println macro removes colors again when we are not on a terminal
-#[macro_export]
-macro_rules! g_println {
-    () => {
-        println!()
-    };
-    ($($arg:tt)*) => {
-        if is_terminal::IsTerminal::is_terminal(&std::io::stdout()) {
-            println!($($arg)*)
-        } else {
-            println!("{}", console::strip_ansi_codes(&format!($($arg)*)).to_string())
-        }
-    };
-}
 // Re-export theme for use in main
 #[derive(Clone, Copy)]
 pub enum Theme {
@@ -176,23 +162,23 @@ pub fn render_message(message: &Message, debug: bool) {
             MessageContent::ToolRequest(req) => render_tool_request(req, theme, debug),
             MessageContent::ToolResponse(resp) => render_tool_response(resp, theme, debug),
             MessageContent::Image(image) => {
-                g_println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
+                println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
             }
             MessageContent::Thinking(thinking) => {
                 if std::env::var("GOOSE_CLI_SHOW_THINKING").is_ok()
                     && std::io::stdout().is_terminal()
                 {
-                    g_println!("\n{}", style("Thinking:").dim().italic());
+                    println!("\n{}", style("Thinking:").dim().italic());
                     print_markdown(&thinking.thinking, theme);
                 }
             }
             MessageContent::RedactedThinking(_) => {
                 // For redacted thinking, print thinking was redacted
-                g_println!("\n{}", style("Thinking:").dim().italic());
+                println!("\n{}", style("Thinking:").dim().italic());
                 print_markdown("Thinking was redacted", theme);
             }
             _ => {
-                g_println!("WARNING: Message content type could not be rendered");
+                println!("WARNING: Message content type could not be rendered");
             }
         }
     }
@@ -222,7 +208,7 @@ pub fn render_text_no_newlines(text: &str, color: Option<Color>, dim: bool) {
 }
 
 pub fn render_enter_plan_mode() {
-    g_println!(
+    println!(
         "\n{} {}\n",
         style("Entering plan mode.").green().bold(),
         style("You can provide instructions to create a plan and then act on it. To exit early, type /endplan")
@@ -232,7 +218,7 @@ pub fn render_enter_plan_mode() {
 }
 
 pub fn render_act_on_plan() {
-    g_println!(
+    println!(
         "\n{}\n",
         style("Exiting plan mode and acting on the above plan")
             .green()
@@ -241,11 +227,11 @@ pub fn render_act_on_plan() {
 }
 
 pub fn render_exit_plan_mode() {
-    g_println!("\n{}\n", style("Exiting plan mode.").green().bold());
+    println!("\n{}\n", style("Exiting plan mode.").green().bold());
 }
 
 pub fn goose_mode_message(text: &str) {
-    g_println!("\n{}", style(text).yellow(),);
+    println!("\n{}", style(text).yellow(),);
 }
 
 fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
@@ -286,7 +272,7 @@ fn render_tool_response(resp: &ToolResponse, theme: Theme, debug: bool) {
                 }
 
                 if debug {
-                    g_println!("{:#?}", content);
+                    println!("{:#?}", content);
                 } else if let Some(text) = content.as_text() {
                     print_markdown(&text.text, theme);
                 }
@@ -297,35 +283,35 @@ fn render_tool_response(resp: &ToolResponse, theme: Theme, debug: bool) {
 }
 
 pub fn render_error(message: &str) {
-    g_println!("\n  {} {}\n", style("error:").red().bold(), message);
+    println!("\n  {} {}\n", style("error:").red().bold(), message);
 }
 
 pub fn render_prompts(prompts: &HashMap<String, Vec<String>>) {
-    g_println!();
+    println!();
     for (extension, prompts) in prompts {
-        g_println!(" {}", style(extension).green());
+        println!(" {}", style(extension).green());
         for prompt in prompts {
-            g_println!("  - {}", style(prompt).cyan());
+            println!("  - {}", style(prompt).cyan());
         }
     }
-    g_println!();
+    println!();
 }
 
 pub fn render_prompt_info(info: &PromptInfo) {
-    g_println!();
+    println!();
 
     if let Some(ext) = &info.extension {
-        g_println!(" {}: {}", style("Extension").green(), ext);
+        println!(" {}: {}", style("Extension").green(), ext);
     }
 
-    g_println!(" Prompt: {}", style(&info.name).cyan().bold());
+    println!(" Prompt: {}", style(&info.name).cyan().bold());
 
     if let Some(desc) = &info.description {
-        g_println!("\n {}", desc);
+        println!("\n {}", desc);
     }
 
     if let Some(args) = &info.arguments {
-        g_println!("\n Arguments:");
+        println!("\n Arguments:");
         for arg in args {
             let required = arg.required.unwrap_or(false);
             let req_str = if required {
@@ -334,7 +320,7 @@ pub fn render_prompt_info(info: &PromptInfo) {
                 style("(optional)").dim()
             };
 
-            g_println!(
+            println!(
                 "  {} {} {}",
                 style(&arg.name).yellow(),
                 req_str,
@@ -342,53 +328,53 @@ pub fn render_prompt_info(info: &PromptInfo) {
             );
         }
     }
-    g_println!();
+    println!();
 }
 
 pub fn render_extension_success(name: &str) {
-    g_println!();
-    g_println!(
+    println!();
+    println!(
         "  {} extension `{}`",
         style("added").green(),
         style(name).cyan(),
     );
-    g_println!();
+    println!();
 }
 
 pub fn render_extension_error(name: &str, error: &str) {
-    g_println!();
-    g_println!(
+    println!();
+    println!(
         "  {} to add extension {}",
         style("failed").red(),
         style(name).red()
     );
-    g_println!();
-    g_println!("{}", style(error).dim());
-    g_println!();
+    println!();
+    println!("{}", style(error).dim());
+    println!();
 }
 
 pub fn render_builtin_success(names: &str) {
-    g_println!();
-    g_println!(
+    println!();
+    println!(
         "  {} builtin{}: {}",
         style("added").green(),
         if names.contains(',') { "s" } else { "" },
         style(names).cyan()
     );
-    g_println!();
+    println!();
 }
 
 pub fn render_builtin_error(names: &str, error: &str) {
-    g_println!();
-    g_println!(
+    println!();
+    println!(
         "  {} to add builtin{}: {}",
         style("failed").red(),
         if names.contains(',') { "s" } else { "" },
         style(names).red()
     );
-    g_println!();
-    g_println!("{}", style(error).dim());
-    g_println!();
+    println!();
+    println!("{}", style(error).dim());
+    println!();
 }
 
 fn render_text_editor_request(call: &ToolCall, debug: bool) {
@@ -396,7 +382,7 @@ fn render_text_editor_request(call: &ToolCall, debug: bool) {
 
     // Print path first with special formatting
     if let Some(Value::String(path)) = call.arguments.get("path") {
-        g_println!(
+        println!(
             "{}: {}",
             style("path").dim(),
             style(shorten_path(path, debug)).green()
@@ -413,7 +399,7 @@ fn render_text_editor_request(call: &ToolCall, debug: bool) {
         }
         print_params(&Value::Object(other_args), 0, debug);
     }
-    g_println!();
+    println!();
 }
 
 fn render_shell_request(call: &ToolCall, debug: bool) {
@@ -421,7 +407,7 @@ fn render_shell_request(call: &ToolCall, debug: bool) {
 
     match call.arguments.get("command") {
         Some(Value::String(s)) => {
-            g_println!("{}: {}", style("command").dim(), style(s).green());
+            println!("{}: {}", style("command").dim(), style(s).green());
         }
         _ => print_params(&call.arguments, 0, debug),
     }
@@ -432,17 +418,17 @@ fn render_dynamic_task_request(call: &ToolCall, debug: bool) {
 
     // Print task_parameters array
     if let Some(Value::Array(task_parameters)) = call.arguments.get("task_parameters") {
-        g_println!("{}:", style("task_parameters").dim());
+        println!("{}:", style("task_parameters").dim());
 
         for task_param in task_parameters.iter() {
-            g_println!("    -");
+            println!("    -");
 
             if let Some(param_obj) = task_param.as_object() {
                 for (key, value) in param_obj {
                     match value {
                         Value::String(s) => {
                             // For strings, print the full content without truncation
-                            g_println!("        {}: {}", style(key).dim(), style(s).green());
+                            println!("        {}: {}", style(key).dim(), style(s).green());
                         }
                         _ => {
                             // For everything else, use print_params
@@ -455,13 +441,13 @@ fn render_dynamic_task_request(call: &ToolCall, debug: bool) {
         }
     }
 
-    g_println!();
+    println!();
 }
 
 fn render_default_request(call: &ToolCall, debug: bool) {
     print_tool_header(call);
     print_params(&call.arguments, 0, debug);
-    g_println!();
+    println!();
 }
 
 // Helper functions
@@ -480,8 +466,8 @@ fn print_tool_header(call: &ToolCall) {
         .magenta()
         .dim(),
     );
-    g_println!();
-    g_println!("{}", tool_header);
+    println!();
+    println!("{}", tool_header);
 }
 
 // Respect NO_COLOR, as https://crates.io/crates/console already does
@@ -522,60 +508,60 @@ fn print_params(value: &Value, depth: usize, debug: bool) {
             for (key, val) in map {
                 match val {
                     Value::Object(_) => {
-                        g_println!("{}{}:", indent, style(key).dim());
+                        println!("{}{}:", indent, style(key).dim());
                         print_params(val, depth + 1, debug);
                     }
                     Value::Array(arr) => {
-                        g_println!("{}{}:", indent, style(key).dim());
+                        println!("{}{}:", indent, style(key).dim());
                         for item in arr.iter() {
-                            g_println!("{}{}- ", indent, INDENT);
+                            println!("{}{}- ", indent, INDENT);
                             print_params(item, depth + 2, debug);
                         }
                     }
                     Value::String(s) => {
                         if !debug && s.len() > get_tool_params_max_length() {
-                            g_println!("{}{}: {}", indent, style(key).dim(), style("...").dim());
+                            println!("{}{}: {}", indent, style(key).dim(), style("...").dim());
                         } else {
-                            g_println!("{}{}: {}", indent, style(key).dim(), style(s).green());
+                            println!("{}{}: {}", indent, style(key).dim(), style(s).green());
                         }
                     }
                     Value::Number(n) => {
-                        g_println!("{}{}: {}", indent, style(key).dim(), style(n).blue());
+                        println!("{}{}: {}", indent, style(key).dim(), style(n).blue());
                     }
                     Value::Bool(b) => {
-                        g_println!("{}{}: {}", indent, style(key).dim(), style(b).blue());
+                        println!("{}{}: {}", indent, style(key).dim(), style(b).blue());
                     }
                     Value::Null => {
-                        g_println!("{}{}: {}", indent, style(key).dim(), style("null").dim());
+                        println!("{}{}: {}", indent, style(key).dim(), style("null").dim());
                     }
                 }
             }
         }
         Value::Array(arr) => {
             for (i, item) in arr.iter().enumerate() {
-                g_println!("{}{}.", indent, i + 1);
+                println!("{}{}.", indent, i + 1);
                 print_params(item, depth + 1, debug);
             }
         }
         Value::String(s) => {
             if !debug && s.len() > get_tool_params_max_length() {
-                g_println!(
+                println!(
                     "{}{}",
                     indent,
                     style(format!("[REDACTED: {} chars]", s.len())).yellow()
                 );
             } else {
-                g_println!("{}{}", indent, style(s).green());
+                println!("{}{}", indent, style(s).green());
             }
         }
         Value::Number(n) => {
-            g_println!("{}{}", indent, style(n).yellow());
+            println!("{}{}", indent, style(n).yellow());
         }
         Value::Bool(b) => {
-            g_println!("{}{}", indent, style(b).yellow());
+            println!("{}{}", indent, style(b).yellow());
         }
         Value::Null => {
-            g_println!("{}{}", indent, style("null").dim());
+            println!("{}{}", indent, style("null").dim());
         }
     }
 }
@@ -649,7 +635,7 @@ pub fn display_session_info(
     if let Some(provider_inst) = provider_instance {
         if let Some(lead_worker) = provider_inst.as_lead_worker() {
             let (lead_model, worker_model) = lead_worker.get_model_info();
-            g_println!(
+            println!(
                 "{} {} {} {} {} {} {}",
                 style(start_session_msg).dim(),
                 style("provider:").dim(),
@@ -660,7 +646,7 @@ pub fn display_session_info(
                 style(&worker_model).cyan().dim(),
             );
         } else {
-            g_println!(
+            println!(
                 "{} {} {} {} {}",
                 style(start_session_msg).dim(),
                 style("provider:").dim(),
@@ -671,7 +657,7 @@ pub fn display_session_info(
         }
     } else {
         // Fallback to original behavior if no provider instance
-        g_println!(
+        println!(
             "{} {} {} {} {}",
             style(start_session_msg).dim(),
             style("provider:").dim(),
@@ -682,14 +668,14 @@ pub fn display_session_info(
     }
 
     if let Some(session_file) = session_file {
-        g_println!(
+        println!(
             "    {} {}",
             style("logging to").dim(),
             style(session_file.display()).dim().cyan(),
         );
     }
 
-    g_println!(
+    println!(
         "    {} {}",
         style("working directory:").dim(),
         style(std::env::current_dir().unwrap().display())
@@ -699,7 +685,7 @@ pub fn display_session_info(
 }
 
 pub fn display_greeting() {
-    g_println!("\nGoose is running! Enter your instructions, or try asking what goose can do.\n");
+    println!("\nGoose is running! Enter your instructions, or try asking what goose can do.\n");
 }
 
 /// Display context window usage with both current and session totals
@@ -707,7 +693,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
     use console::style;
 
     if context_limit == 0 {
-        g_println!("Context: Error - context limit is zero");
+        println!("Context: Error - context limit is zero");
         return;
     }
 
@@ -735,12 +721,9 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
     };
 
     // Print the status line
-    g_println!(
+    println!(
         "Context: {} {}% ({}/{} tokens)",
-        colored_dots,
-        percentage,
-        total_tokens,
-        context_limit
+        colored_dots, percentage, total_tokens, context_limit
     );
 }
 
