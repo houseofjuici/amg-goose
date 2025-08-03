@@ -1,16 +1,14 @@
-# AMG Care Nudge Recipe (placeholder)
-name: amg_care_nudge
+name: AMG Care Nudge
 version: 0.1.0
-triggers:
-  - type: schedule
-    ref: schedules/amg_care_nudge.cron.yml
+inputs:
+  product_handle: string
+  days_since_purchase: number
 steps:
-  - id: segment
-    type: logic
-    description: "Identify users/items needing care nudge"
-  - id: craft
-    type: logic
-    description: "Generate tailored message"
-  - id: send
-    type: tool
-    description: "Dispatch via email/SMS/DM"
+  - id: tips
+    uses: llm.generate
+    with:
+      prompt: |
+        Create a concise care tip and friendly nudge for product {{ inputs.product_handle }}
+        tuned to {{ inputs.days_since_purchase }} days after purchase.
+outputs:
+  message: "{{ steps.tips.output }}"

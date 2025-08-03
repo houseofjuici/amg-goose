@@ -1,16 +1,21 @@
-# AMG Returns Recipe (placeholder)
-name: amg_returns
+name: AMG Returns Triage
 version: 0.1.0
-triggers:
-  - type: http
-    path: /amg/returns
+inputs:
+  order_id: string
+  customer_email: string
+  reason: string
 steps:
-  - id: intake
-    type: input
-    description: "Collect order and item details for return request"
-  - id: validate
-    type: logic
-    description: "Validate eligibility and policy checks"
-  - id: outcome
-    type: output
-    description: "Return label generation or exception routing"
+  - id: validate_order
+    uses: shopify.get_order
+    with:
+      order_id: "{{ inputs.order_id }}"
+  - id: triage
+    uses: llm.generate
+    with:
+      prompt: |
+        Triage a return.
+        Order: {{ steps.validate_order.output | json }}
+        Reason: {{ inputs.reason }}
+        Decide approve/deny/exchange, include short message template for customer.
+outputs:
+  decision: "{{ steps.triage.output }}"

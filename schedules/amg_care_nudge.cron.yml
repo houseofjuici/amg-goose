@@ -1,5 +1,6 @@
-# AMG Care Nudge schedule (placeholder)
-name: amg_care_nudge_schedule
-cron: "0 14 * * *"  # 2 PM daily UTC
-recipes:
-  - recipes/amg/care_nudge.yml
+name: AMG Care Nudge Schedule
+cron: "0 14 * * *"
+recipe: recipes/amg/care_nudge.yml
+args:
+  product_handle: "classic-tee"
+  days_since_purchase: 7

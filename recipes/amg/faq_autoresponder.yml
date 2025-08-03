@@ -1,16 +1,13 @@
-# AMG FAQ Autoresponder Recipe (placeholder)
-name: amg_faq_autoresponder
+name: AMG FAQ Autoresponder
 version: 0.1.0
-triggers:
-  - type: http
-    path: /amg/faq
+inputs:
+  question: string
 steps:
-  - id: intake
-    type: input
-    description: "Capture FAQ query"
-  - id: retrieve
-    type: logic
-    description: "Match to known FAQ answers"
-  - id: respond
-    type: output
-    description: "Return answer or escalate"
+  - id: answer
+    uses: llm.generate
+    with:
+      prompt: |
+        Answer the customer question using concise, friendly tone. If uncertain, ask a clarifying
+        question. Question: {{ inputs.question }}
+outputs:
+  reply: "{{ steps.answer.output }}"

@@ -1,16 +1,18 @@
-# AMG Order Status Recipe (placeholder)
-name: amg_order_status
+name: AMG Order Status
 version: 0.1.0
-triggers:
-  - type: http
-    path: /amg/order-status
+inputs:
+  order_id: string
+  email_or_phone: string
 steps:
-  - id: intake
-    type: input
-    description: "Collect order identifier"
-  - id: query
-    type: tool
-    description: "Query order status via commerce API"
-  - id: respond
-    type: output
-    description: "Return status details to user"
+  - id: fetch
+    uses: shopify.get_order_status
+    with:
+      order_id: "{{ inputs.order_id }}"
+  - id: compose
+    uses: llm.generate
+    with:
+      prompt: |
+        Summarize order status with ETA and tracking when available.
+        Payload: {{ steps.fetch.output | json }}
+outputs:
+  status_message: "{{ steps.compose.output }}"

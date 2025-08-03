@@ -1,16 +1,22 @@
-# AMG Fit Advisor Recipe (placeholder)
-name: amg_fit_advisor
+name: AMG Fit Advisor
 version: 0.1.0
-triggers:
-  - type: http
-    path: /amg/fit-advisor
+inputs:
+  product_handle: string
+  measurements: string
+  preferences: string
 steps:
-  - id: intake
-    type: input
-    description: "Gather user preferences and body metrics"
-  - id: recommend
-    type: logic
-    description: "Generate fit recommendations"
-  - id: deliver
-    type: output
-    description: "Present advisory via chat or email"
+  - id: fetch_product
+    uses: shopify.get_product
+    with:
+      handle: "{{ inputs.product_handle }}"
+  - id: analyze_fit
+    uses: llm.generate
+    with:
+      prompt: |
+        You are an expert apparel fit assistant.
+        Product data: {{ steps.fetch_product.output | json }}
+        Customer measurements: {{ inputs.measurements }}
+        Preferences: {{ inputs.preferences }}
+        Output: recommended size (S/M/L etc), short rationale, confidence 0-1.
+outputs:
+  recommendation: "{{ steps.analyze_fit.output }}"

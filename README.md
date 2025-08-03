@@ -39,3 +39,6 @@ Designed for maximum flexibility, goose works with any LLM and supports multi-mo
 - [Nostr](https://njump.me/opensource@block.xyz)
 
 - See AMG docs: [docs/amg/README.md](docs/amg/README.md)
+
+## AMG Docs
+See docs/amg/README.md for run instructions and recipes.
