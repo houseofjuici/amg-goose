@@ -1,0 +1,16 @@
+# AMG FAQ Autoresponder Recipe (placeholder)
+name: amg_faq_autoresponder
+version: 0.1.0
+triggers:
+  - type: http
+    path: /amg/faq
+steps:
+  - id: intake
+    type: input
+    description: "Capture FAQ query"
+  - id: retrieve
+    type: logic
+    description: "Match to known FAQ answers"
+  - id: respond
+    type: output
+    description: "Return answer or escalate"

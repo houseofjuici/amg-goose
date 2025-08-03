@@ -1,0 +1,16 @@
+# AMG Fit Advisor Recipe (placeholder)
+name: amg_fit_advisor
+version: 0.1.0
+triggers:
+  - type: http
+    path: /amg/fit-advisor
+steps:
+  - id: intake
+    type: input
+    description: "Gather user preferences and body metrics"
+  - id: recommend
+    type: logic
+    description: "Generate fit recommendations"
+  - id: deliver
+    type: output
+    description: "Present advisory via chat or email"

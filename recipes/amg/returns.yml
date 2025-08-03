@@ -1,0 +1,16 @@
+# AMG Returns Recipe (placeholder)
+name: amg_returns
+version: 0.1.0
+triggers:
+  - type: http
+    path: /amg/returns
+steps:
+  - id: intake
+    type: input
+    description: "Collect order and item details for return request"
+  - id: validate
+    type: logic
+    description: "Validate eligibility and policy checks"
+  - id: outcome
+    type: output
+    description: "Return label generation or exception routing"

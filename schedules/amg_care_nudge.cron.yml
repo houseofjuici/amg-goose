@@ -1,0 +1,5 @@
+# AMG Care Nudge schedule (placeholder)
+name: amg_care_nudge_schedule
+cron: "0 14 * * *"  # 2 PM daily UTC
+recipes:
+  - recipes/amg/care_nudge.yml

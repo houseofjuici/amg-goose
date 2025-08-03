@@ -1,0 +1,16 @@
+# AMG Care Nudge Recipe (placeholder)
+name: amg_care_nudge
+version: 0.1.0
+triggers:
+  - type: schedule
+    ref: schedules/amg_care_nudge.cron.yml
+steps:
+  - id: segment
+    type: logic
+    description: "Identify users/items needing care nudge"
+  - id: craft
+    type: logic
+    description: "Generate tailored message"
+  - id: send
+    type: tool
+    description: "Dispatch via email/SMS/DM"

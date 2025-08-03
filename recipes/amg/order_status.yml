@@ -1,0 +1,16 @@
+# AMG Order Status Recipe (placeholder)
+name: amg_order_status
+version: 0.1.0
+triggers:
+  - type: http
+    path: /amg/order-status
+steps:
+  - id: intake
+    type: input
+    description: "Collect order identifier"
+  - id: query
+    type: tool
+    description: "Query order status via commerce API"
+  - id: respond
+    type: output
+    description: "Return status details to user"
