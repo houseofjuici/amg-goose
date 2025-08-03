@@ -4,8 +4,8 @@ import { useState, useEffect } from "react";
 
 const LinuxDesktopInstallButtons = () => {
   const [downloadUrls, setDownloadUrls] = useState({
-    deb: "https://github.com/block/goose/releases/download/v1.1.4/goose_1.1.4_amd64.deb",
-    rpm: "https://github.com/block/goose/releases/download/v1.1.4/Goose-1.1.4-1.x86_64.rpm"
+    deb: "https://github.com/block/goose/releases/latest",
+    rpm: "https://github.com/block/goose/releases/latest"
   });
 
   useEffect(() => {
