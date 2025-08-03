@@ -405,14 +405,15 @@ impl Provider for GithubCopilotProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
-        let payload =
-            create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi)?;
+        let payload = create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi)?;
 
         // Make request with retry
-        let response = self.with_retry(|| async {
-            let mut payload_clone = payload.clone();
-            self.post(&mut payload_clone).await
-        }).await?;
+        let response = self
+            .with_retry(|| async {
+                let mut payload_clone = payload.clone();
+                self.post(&mut payload_clone).await
+            })
+            .await?;
 
         // Parse response
         let message = response_to_message(&response)?;

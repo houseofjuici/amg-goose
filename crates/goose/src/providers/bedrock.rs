@@ -68,7 +68,12 @@ impl BedrockProvider {
         Ok(Self { client, model })
     }
 
-    async fn converse(&self, system: &str, messages: &[Message], tools: &[Tool]) -> Result<(bedrock::Message, Option<bedrock::TokenUsage>), ProviderError> {
+    async fn converse(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<(bedrock::Message, Option<bedrock::TokenUsage>), ProviderError> {
         let model_name = &self.model.model_name;
 
         let mut request = self
@@ -87,33 +92,41 @@ impl BedrockProvider {
             request = request.tool_config(to_bedrock_tool_config(tools)?);
         }
 
-        let response = request.send().await.map_err(|err| {
-            match err.into_service_error() {
+        let response = request
+            .send()
+            .await
+            .map_err(|err| match err.into_service_error() {
                 ConverseError::ThrottlingException(throttle_err) => {
-                    ProviderError::RateLimitExceeded(format!("Bedrock throttling error: {:?}", throttle_err))
+                    ProviderError::RateLimitExceeded(format!(
+                        "Bedrock throttling error: {:?}",
+                        throttle_err
+                    ))
                 }
                 ConverseError::AccessDeniedException(err) => {
                     ProviderError::Authentication(format!("Failed to call Bedrock: {:?}", err))
                 }
                 ConverseError::ValidationException(err)
-                    if err.message().unwrap_or_default().contains("Input is too long for requested model.") =>
+                    if err
+                        .message()
+                        .unwrap_or_default()
+                        .contains("Input is too long for requested model.") =>
                 {
-                    ProviderError::ContextLengthExceeded(format!("Failed to call Bedrock: {:?}", err))
+                    ProviderError::ContextLengthExceeded(format!(
+                        "Failed to call Bedrock: {:?}",
+                        err
+                    ))
                 }
                 ConverseError::ModelErrorException(err) => {
                     ProviderError::ExecutionError(format!("Failed to call Bedrock: {:?}", err))
                 }
-                err => {
-                    ProviderError::ServerError(format!("Failed to call Bedrock: {:?}", err))
-                }
-            }
-        })?;
+                err => ProviderError::ServerError(format!("Failed to call Bedrock: {:?}", err)),
+            })?;
 
         match response.output {
-            Some(bedrock::ConverseOutput::Message(message)) => {
-                Ok((message, response.usage))
-            }
-            _ => Err(ProviderError::RequestFailed("No output from Bedrock".to_string())),
+            Some(bedrock::ConverseOutput::Message(message)) => Ok((message, response.usage)),
+            _ => Err(ProviderError::RequestFailed(
+                "No output from Bedrock".to_string(),
+            )),
         }
     }
 }
@@ -150,7 +163,9 @@ impl Provider for BedrockProvider {
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let model_name = &self.model.model_name;
 
-        let (bedrock_message, bedrock_usage) = self.with_retry(|| self.converse(system, messages, tools)).await?;
+        let (bedrock_message, bedrock_usage) = self
+            .with_retry(|| self.converse(system, messages, tools))
+            .await?;
 
         let usage = bedrock_usage
             .as_ref()

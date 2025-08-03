@@ -295,7 +295,9 @@ impl Provider for SageMakerTgiProvider {
             ProviderError::RequestFailed(format!("Failed to create request: {}", e))
         })?;
 
-        let response = self.with_retry(|| self.invoke_endpoint(request_payload.clone())).await?;
+        let response = self
+            .with_retry(|| self.invoke_endpoint(request_payload.clone()))
+            .await?;
 
         let message = self.parse_tgi_response(response)?;
 

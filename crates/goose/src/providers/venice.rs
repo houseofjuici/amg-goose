@@ -1,11 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use reqwest::{Client, Response};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
-use std::time::Duration;
 
+use super::api_client::{ApiClient, AuthMethod};
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
 use super::retry::ProviderRetry;
@@ -72,14 +71,12 @@ const FALLBACK_MODELS: [&str; 3] = [
     "mistral-31-24b", // Another model with function calling
 ];
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct VeniceProvider {
     #[serde(skip)]
-    client: Client,
-    host: String,
+    api_client: ApiClient,
     base_path: String,
     models_path: String,
-    api_key: String,
     model: ModelConfig,
 }
 
@@ -102,47 +99,21 @@ impl VeniceProvider {
         // Ensure we only keep the bare model id internally
         model.model_name = strip_flags(&model.model_name).to_string();
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let auth = AuthMethod::BearerToken(api_key);
+        let api_client = ApiClient::new(host, auth)?;
 
         let instance = Self {
-            client,
-            host,
+            api_client,
             base_path,
             models_path,
-            api_key,
             model,
         };
 
         Ok(instance)
     }
 
-    async fn post(&self, path: &str, body: &str) -> Result<Response, ProviderError> {
-        let base_url = url::Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let url = base_url
-            .join(path)
-            .map_err(|e| ProviderError::RequestFailed(format!("Failed to construct URL: {e}")))?;
-        // Choose GET for models endpoint, POST otherwise
-        let method = if path.contains("models") {
-            tracing::debug!("Using GET method for models endpoint");
-            self.client.get(url.clone())
-        } else {
-            tracing::debug!("Using POST method for completions endpoint");
-            self.client.post(url.clone())
-        };
-
-        // Log the request details
-        tracing::debug!("Venice request URL: {}", url);
-        tracing::debug!("Venice request body: {}", body);
-
-        let response = method
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await?;
+    async fn post(&self, path: &str, payload: &Value) -> Result<Value, ProviderError> {
+        let response = self.api_client.response_post(path, payload).await?;
 
         let status = response.status();
         tracing::debug!("Venice response status: {}", status);
@@ -202,7 +173,13 @@ impl VeniceProvider {
             return Err(map_http_error_to_provider_error(status, error_json));
         }
 
-        Ok(response)
+        let response_text = response.text().await?;
+        serde_json::from_str(&response_text).map_err(|e| {
+            ProviderError::RequestFailed(format!(
+                "Failed to parse JSON: {}\nResponse: {}",
+                e, response_text
+            ))
+        })
     }
 }
 
@@ -240,27 +217,8 @@ impl Provider for VeniceProvider {
     }
 
     async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
-        // Fetch supported models via Venice API
-        let base_url = url::Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {}", e)))?;
-        let models_url = base_url.join(&self.models_path).map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct models URL: {}", e))
-        })?;
-        let response = self
-            .client
-            .get(models_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(ProviderError::RequestFailed(format!(
-                "Venice API request failed with status {}",
-                response.status()
-            )));
-        }
-        let body = response.text().await?;
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| ProviderError::RequestFailed(format!("Failed to parse JSON: {}", e)))?;
+        let response = self.api_client.response_get(&self.models_path).await?;
+        let json: serde_json::Value = response.json().await?;
 
         // Print legend once so users know what flags mean
         println!(
@@ -464,17 +422,12 @@ impl Provider for VeniceProvider {
         tracing::debug!("Venice request payload: {}", payload.to_string());
 
         // Send request with retry
-        let payload_str = payload.to_string();
-        let response = self.with_retry(|| self.post(&self.base_path, &payload_str)).await?;
+        let response = self
+            .with_retry(|| self.post(&self.base_path, &payload))
+            .await?;
 
-        // Parse the response
-        let response_text = response.text().await?;
-        let response_json: Value = serde_json::from_str(&response_text).map_err(|e| {
-            ProviderError::RequestFailed(format!(
-                "Failed to parse JSON: {}\nResponse: {}",
-                e, response_text
-            ))
-        })?;
+        // Parse the response - response is already a Value from our post method
+        let response_json = response;
 
         // Handle tool calls from the response if present
         let tool_calls = response_json["choices"]

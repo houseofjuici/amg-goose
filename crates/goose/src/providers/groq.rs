@@ -1,3 +1,4 @@
+use super::api_client::{ApiClient, AuthMethod};
 use super::errors::ProviderError;
 use super::retry::ProviderRetry;
 use super::utils::{get_model, handle_response_openai_compat};
@@ -8,11 +9,8 @@ use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsag
 use crate::providers::formats::openai::{create_request, get_usage, response_to_message};
 use anyhow::Result;
 use async_trait::async_trait;
-use reqwest::Client;
 use rmcp::model::Tool;
 use serde_json::Value;
-use std::time::Duration;
-use url::Url;
 
 pub const GROQ_API_HOST: &str = "https://api.groq.com";
 pub const GROQ_DEFAULT_MODEL: &str = "moonshotai/kimi-k2-instruct";
@@ -28,9 +26,7 @@ pub const GROQ_DOC_URL: &str = "https://console.groq.com/docs/models";
 #[derive(serde::Serialize)]
 pub struct GroqProvider {
     #[serde(skip)]
-    client: Client,
-    host: String,
-    api_key: String,
+    api_client: ApiClient,
     model: ModelConfig,
 }
 
@@ -44,33 +40,17 @@ impl GroqProvider {
             .get_param("GROQ_HOST")
             .unwrap_or_else(|_| GROQ_API_HOST.to_string());
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let auth = AuthMethod::BearerToken(api_key);
+        let api_client = ApiClient::new(host, auth)?;
 
-        Ok(Self {
-            client,
-            host,
-            api_key,
-            model,
-        })
+        Ok(Self { api_client, model })
     }
 
     async fn post(&self, payload: Value) -> Result<Value, ProviderError> {
-        let base_url = Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let url = base_url.join("openai/v1/chat/completions").map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
-        })?;
-
         let response = self
-            .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&payload)
-            .send()
+            .api_client
+            .response_post("openai/v1/chat/completions", &payload)
             .await?;
-
         handle_response_openai_compat(response).await
     }
 }
@@ -128,22 +108,12 @@ impl Provider for GroqProvider {
 
     /// Fetch supported models from Groq; returns Err on failure, Ok(None) if no models found
     async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
-        // Construct the Groq models endpoint
-        let base_url = url::Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {}", e)))?;
-        let url = base_url.join("openai/v1/models").map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {}", e))
-        })?;
-
-        // Build the request with required headers
-        let request = self
-            .client
-            .get(url)
-            .bearer_auth(&self.api_key)
-            .header("Content-Type", "application/json");
-
-        // Send request
-        let response = request.send().await?;
+        let response = self
+            .api_client
+            .request("openai/v1/models")
+            .header("Content-Type", "application/json")?
+            .response_get()
+            .await?;
         let response = handle_response_openai_compat(response).await?;
 
         let data = response

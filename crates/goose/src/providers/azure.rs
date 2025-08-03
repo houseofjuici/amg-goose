@@ -1,11 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
-use std::time::Duration;
 
-use super::azureauth::AzureAuth;
+use super::api_client::{ApiClient, AuthMethod, AuthProvider};
+use super::azureauth::{AuthError, AzureAuth};
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
 use super::formats::openai::{create_request, get_usage, response_to_message};
@@ -24,9 +23,7 @@ pub const AZURE_OPENAI_KNOWN_MODELS: &[&str] = &["gpt-4o", "gpt-4o-mini", "gpt-4
 
 #[derive(Debug)]
 pub struct AzureProvider {
-    client: Client,
-    auth: AzureAuth,
-    endpoint: String,
+    api_client: ApiClient,
     deployment_name: String,
     api_version: String,
     model: ModelConfig,
@@ -38,11 +35,36 @@ impl Serialize for AzureProvider {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("AzureProvider", 3)?;
-        state.serialize_field("endpoint", &self.endpoint)?;
+        let mut state = serializer.serialize_struct("AzureProvider", 2)?;
         state.serialize_field("deployment_name", &self.deployment_name)?;
         state.serialize_field("api_version", &self.api_version)?;
         state.end()
+    }
+}
+
+// Custom auth provider that wraps AzureAuth
+struct AzureAuthProvider {
+    auth: AzureAuth,
+}
+
+#[async_trait]
+impl AuthProvider for AzureAuthProvider {
+    async fn get_auth_header(&self) -> Result<(String, String)> {
+        let auth_token = self
+            .auth
+            .get_token()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get authentication token: {}", e))?;
+
+        match self.auth.credential_type() {
+            super::azureauth::AzureCredentials::ApiKey(_) => {
+                Ok(("api-key".to_string(), auth_token.token_value))
+            }
+            super::azureauth::AzureCredentials::DefaultCredential => Ok((
+                "Authorization".to_string(),
+                format!("Bearer {}", auth_token.token_value),
+            )),
+        }
     }
 }
 
@@ -61,16 +83,16 @@ impl AzureProvider {
             .get_secret("AZURE_OPENAI_API_KEY")
             .ok()
             .filter(|key: &String| !key.is_empty());
-        let auth = AzureAuth::new(api_key)?;
+        let auth = AzureAuth::new(api_key).map_err(|e| match e {
+            AuthError::Credentials(msg) => anyhow::anyhow!("Credentials error: {}", msg),
+            AuthError::TokenExchange(msg) => anyhow::anyhow!("Token exchange error: {}", msg),
+        })?;
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let auth_provider = AzureAuthProvider { auth };
+        let api_client = ApiClient::new(endpoint, AuthMethod::Custom(Box::new(auth_provider)))?;
 
         Ok(Self {
-            client,
-            endpoint,
-            auth,
+            api_client,
             deployment_name,
             api_version,
             model,
@@ -78,48 +100,13 @@ impl AzureProvider {
     }
 
     async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
-        let mut base_url = url::Url::parse(&self.endpoint)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
+        // Build the path for Azure OpenAI
+        let path = format!(
+            "openai/deployments/{}/chat/completions?api-version={}",
+            self.deployment_name, self.api_version
+        );
 
-        // Get the existing path without trailing slashes
-        let existing_path = base_url.path().trim_end_matches('/');
-        let new_path = if existing_path.is_empty() {
-            format!(
-                "/openai/deployments/{}/chat/completions",
-                self.deployment_name
-            )
-        } else {
-            format!(
-                "{}/openai/deployments/{}/chat/completions",
-                existing_path, self.deployment_name
-            )
-        };
-
-        base_url.set_path(&new_path);
-        base_url.set_query(Some(&format!("api-version={}", self.api_version)));
-
-        // Get a fresh auth token for each attempt
-        let auth_token = self.auth.get_token().await.map_err(|e| {
-            tracing::error!("Authentication error: {:?}", e);
-            ProviderError::RequestFailed(format!("Failed to get authentication token: {}", e))
-        })?;
-
-        let mut request_builder = self.client.post(base_url.clone());
-        let token_value = auth_token.token_value.clone();
-
-        // Set the correct header based on authentication type
-        match self.auth.credential_type() {
-            super::azureauth::AzureCredentials::ApiKey(_) => {
-                request_builder = request_builder.header("api-key", token_value.clone());
-            }
-            super::azureauth::AzureCredentials::DefaultCredential => {
-                request_builder = request_builder
-                    .header("Authorization", format!("Bearer {}", token_value.clone()));
-            }
-        }
-
-        let response = request_builder.json(&payload).send().await?;
-
+        let response = self.api_client.response_post(&path, payload).await?;
         handle_response_openai_compat(response).await
     }
 }
@@ -158,10 +145,12 @@ impl Provider for AzureProvider {
         tools: &[Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let payload = create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi)?;
-        let response = self.with_retry(|| async {
-            let payload_clone = payload.clone();
-            self.post(&payload_clone).await
-        }).await?;
+        let response = self
+            .with_retry(|| async {
+                let payload_clone = payload.clone();
+                self.post(&payload_clone).await
+            })
+            .await?;
 
         let message = response_to_message(&response)?;
         let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {

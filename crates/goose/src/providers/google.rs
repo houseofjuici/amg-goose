@@ -1,3 +1,4 @@
+use super::api_client::{ApiClient, AuthMethod};
 use super::errors::ProviderError;
 use super::retry::ProviderRetry;
 use super::utils::{emit_debug_trace, handle_response_google_compat, unescape_json_values};
@@ -8,12 +9,8 @@ use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsag
 use crate::providers::formats::google::{create_request, get_usage, response_to_message};
 use anyhow::Result;
 use async_trait::async_trait;
-use axum::http::HeaderMap;
-use reqwest::Client;
 use rmcp::model::Tool;
 use serde_json::Value;
-use std::time::Duration;
-use url::Url;
 
 pub const GOOGLE_API_HOST: &str = "https://generativelanguage.googleapis.com";
 pub const GOOGLE_DEFAULT_MODEL: &str = "gemini-2.5-flash";
@@ -50,8 +47,7 @@ pub const GOOGLE_DOC_URL: &str = "https://ai.google.dev/gemini-api/docs/models";
 #[derive(Debug, serde::Serialize)]
 pub struct GoogleProvider {
     #[serde(skip)]
-    client: Client,
-    host: String,
+    api_client: ApiClient,
     model: ModelConfig,
 }
 
@@ -65,42 +61,20 @@ impl GoogleProvider {
             .get_param("GOOGLE_HOST")
             .unwrap_or_else(|_| GOOGLE_API_HOST.to_string());
 
-        let mut headers = HeaderMap::new();
-        headers.insert("CONTENT_TYPE", "application/json".parse()?);
-        headers.insert("x-goog-api-key", api_key.parse()?);
+        let auth = AuthMethod::ApiKey {
+            header_name: "x-goog-api-key".to_string(),
+            key: api_key,
+        };
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .default_headers(headers)
-            .build()?;
+        let api_client =
+            ApiClient::new(host, auth)?.with_header("Content-Type", "application/json")?;
 
-        Ok(Self {
-            client,
-            host,
-            model,
-        })
+        Ok(Self { api_client, model })
     }
 
     async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
-        let base_url = Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-
-        let url = base_url
-            .join(&format!(
-                "v1beta/models/{}:generateContent",
-                self.model.model_name
-            ))
-            .map_err(|e| {
-                ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
-            })?;
-
-        let response = self
-            .client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await?;
-
+        let path = format!("v1beta/models/{}:generateContent", self.model.model_name);
+        let response = self.api_client.response_post(&path, payload).await?;
         handle_response_google_compat(response).await
     }
 }
@@ -139,10 +113,12 @@ impl Provider for GoogleProvider {
         let payload = create_request(&self.model, system, messages, tools)?;
 
         // Make request
-        let response = self.with_retry(|| async {
-            let payload_clone = payload.clone();
-            self.post(&payload_clone).await
-        }).await?;
+        let response = self
+            .with_retry(|| async {
+                let payload_clone = payload.clone();
+                self.post(&payload_clone).await
+            })
+            .await?;
 
         // Parse response
         let message = response_to_message(unescape_json_values(&response))?;
@@ -158,11 +134,8 @@ impl Provider for GoogleProvider {
 
     /// Fetch supported models from Google Generative Language API; returns Err on failure, Ok(None) if not present
     async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
-        // List models via the v1beta/models endpoint
-        let url = format!("{}/v1beta/models", self.host);
-        let response = self.client.get(&url).send().await?;
+        let response = self.api_client.response_get("v1beta/models").await?;
         let json: serde_json::Value = response.json().await?;
-        // If 'models' field missing, return None
         let arr = match json.get("models").and_then(|v| v.as_array()) {
             Some(arr) => arr,
             None => return Ok(None),

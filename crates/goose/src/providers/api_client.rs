@@ -18,7 +18,11 @@ pub struct ApiClient {
 
 pub enum AuthMethod {
     BearerToken(String),
-    ApiKey { header_name: String, key: String },
+    ApiKey {
+        header_name: String,
+        key: String,
+    },
+    #[allow(dead_code)]
     OAuth(OAuthConfig),
     Custom(Box<dyn AuthProvider>),
 }
@@ -156,6 +160,7 @@ impl<'a> ApiRequestBuilder<'a> {
         Ok(self)
     }
 
+    #[allow(dead_code)]
     pub fn headers(mut self, headers: HeaderMap) -> Self {
         self.headers.extend(headers);
         self

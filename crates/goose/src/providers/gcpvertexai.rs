@@ -260,9 +260,7 @@ impl GcpVertexAIProvider {
                     self.retry_config.max_retries
                 );
                 tracing::error!("{}", error_msg);
-                return Err(
-                    last_error.unwrap_or(ProviderError::RateLimitExceeded(error_msg))
-                );
+                return Err(last_error.unwrap_or(ProviderError::RateLimitExceeded(error_msg)));
             }
 
             // Get a fresh auth token for each attempt
@@ -544,7 +542,6 @@ impl Provider for GcpVertexAIProvider {
         self.model.clone()
     }
 }
-
 
 #[cfg(test)]
 mod tests {

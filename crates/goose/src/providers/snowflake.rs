@@ -1,10 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::Duration;
 
+use super::api_client::{ApiClient, AuthMethod};
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage};
 use super::errors::ProviderError;
 use super::formats::snowflake::{create_request, get_usage, response_to_message};
@@ -15,7 +14,6 @@ use crate::impl_provider_default;
 use crate::message::Message;
 use crate::model::ModelConfig;
 use rmcp::model::Tool;
-use url::Url;
 
 pub const SNOWFLAKE_DEFAULT_MODEL: &str = "claude-3-7-sonnet";
 pub const SNOWFLAKE_KNOWN_MODELS: &[&str] = &["claude-3-7-sonnet", "claude-3-5-sonnet"];
@@ -37,9 +35,7 @@ impl SnowflakeAuth {
 #[derive(Debug, serde::Serialize)]
 pub struct SnowflakeProvider {
     #[serde(skip)]
-    client: Client,
-    host: String,
-    auth: SnowflakeAuth,
+    api_client: ApiClient,
     model: ModelConfig,
     image_format: ImageFormat,
 }
@@ -83,50 +79,27 @@ impl SnowflakeProvider {
             .into());
         }
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        // Ensure host has https:// prefix
+        let base_url = if !host.starts_with("https://") && !host.starts_with("http://") {
+            format!("https://{}", host)
+        } else {
+            host
+        };
 
-        // Use token-based authentication
-        let api_key = token?;
+        let auth = AuthMethod::BearerToken(token?);
+        let api_client = ApiClient::new(base_url, auth)?.with_header("User-Agent", "Goose")?;
+
         Ok(Self {
-            client,
-            host,
-            auth: SnowflakeAuth::token(api_key),
+            api_client,
             model,
             image_format: ImageFormat::OpenAi,
         })
     }
 
-    async fn ensure_auth_header(&self) -> Result<String> {
-        match &self.auth {
-            // https://docs.snowflake.com/en/developer-guide/snowflake-rest-api/authentication#using-a-programmatic-access-token-pat
-            SnowflakeAuth::Token(token) => Ok(format!("Bearer {}", token)),
-        }
-    }
-
     async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
-        let base_url_str =
-            if !self.host.starts_with("https://") && !self.host.starts_with("http://") {
-                format!("https://{}", self.host)
-            } else {
-                self.host.clone()
-            };
-        let base_url = Url::parse(&base_url_str)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let path = "api/v2/cortex/inference:complete";
-        let url = base_url.join(path).map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
-        })?;
-
-        let auth_header = self.ensure_auth_header().await?;
         let response = self
-            .client
-            .post(url)
-            .header("Authorization", auth_header)
-            .header("User-Agent", "Goose")
-            .json(&payload)
-            .send()
+            .api_client
+            .response_post("api/v2/cortex/inference:complete", payload)
             .await?;
 
         let status = response.status();
@@ -337,10 +310,12 @@ impl Provider for SnowflakeProvider {
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let payload = create_request(&self.model, system, messages, tools)?;
 
-        let response = self.with_retry(|| async {
-            let payload_clone = payload.clone();
-            self.post(&payload_clone).await
-        }).await?;
+        let response = self
+            .with_retry(|| async {
+                let payload_clone = payload.clone();
+                self.post(&payload_clone).await
+            })
+            .await?;
 
         // Parse response
         let message = response_to_message(&response)?;

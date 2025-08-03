@@ -1,3 +1,4 @@
+use super::api_client::{ApiClient, AuthMethod};
 use super::errors::ProviderError;
 use super::retry::ProviderRetry;
 use super::utils::{get_model, handle_response_openai_compat};
@@ -8,22 +9,19 @@ use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsag
 use crate::providers::formats::openai::{create_request, get_usage, response_to_message};
 use anyhow::Result;
 use async_trait::async_trait;
-use reqwest::Client;
 use rmcp::model::Tool;
 use serde_json::Value;
-use std::time::Duration;
-use url::Url;
 
 pub const XAI_API_HOST: &str = "https://api.x.ai/v1";
 pub const XAI_DEFAULT_MODEL: &str = "grok-3";
 pub const XAI_KNOWN_MODELS: &[&str] = &[
+    "grok-4-0709",
     "grok-3",
     "grok-3-fast",
     "grok-3-mini",
     "grok-3-mini-fast",
     "grok-2-vision-1212",
     "grok-2-image-1212",
-    "grok-2-1212",
     "grok-3-latest",
     "grok-3-fast-latest",
     "grok-3-mini-latest",
@@ -41,9 +39,7 @@ pub const XAI_DOC_URL: &str = "https://docs.x.ai/docs/overview";
 #[derive(serde::Serialize)]
 pub struct XaiProvider {
     #[serde(skip)]
-    client: Client,
-    host: String,
-    api_key: String,
+    api_client: ApiClient,
     model: ModelConfig,
 }
 
@@ -57,40 +53,18 @@ impl XaiProvider {
             .get_param("XAI_HOST")
             .unwrap_or_else(|_| XAI_API_HOST.to_string());
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let auth = AuthMethod::BearerToken(api_key);
+        let api_client = ApiClient::new(host, auth)?;
 
-        Ok(Self {
-            client,
-            host,
-            api_key,
-            model,
-        })
+        Ok(Self { api_client, model })
     }
 
     async fn post(&self, payload: Value) -> Result<Value, ProviderError> {
-        // Ensure the host ends with a slash for proper URL joining
-        let host = if self.host.ends_with('/') {
-            self.host.clone()
-        } else {
-            format!("{}/", self.host)
-        };
-        let base_url = Url::parse(&host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let url = base_url.join("chat/completions").map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
-        })?;
-
-        tracing::debug!("xAI API URL: {}", url);
         tracing::debug!("xAI request model: {:?}", self.model.model_name);
 
         let response = self
-            .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&payload)
-            .send()
+            .api_client
+            .response_post("chat/completions", &payload)
             .await?;
 
         handle_response_openai_compat(response).await
