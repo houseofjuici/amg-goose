@@ -6,9 +6,10 @@ use anyhow::Result;
 use base64::Engine;
 use etcetera::{choose_app_strategy, AppStrategy};
 use indoc::formatdoc;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     future::Future,
     io::{Cursor, Read},
@@ -20,6 +21,7 @@ use tokio::{
     process::Command,
     sync::mpsc,
 };
+use tokio_stream::{wrappers::SplitStream, StreamExt as _};
 use url::Url;
 
 use include_dir::{include_dir, Dir};
@@ -27,13 +29,14 @@ use mcp_core::{
     handler::{require_str_parameter, PromptError, ResourceError, ToolError},
     protocol::ServerCapabilities,
 };
+use once_cell::sync::Lazy;
 
 use mcp_server::router::CapabilitiesBuilder;
 use mcp_server::Router;
 
 use rmcp::model::{
     Content, JsonRpcMessage, JsonRpcNotification, JsonRpcVersion2_0, Notification, Prompt,
-    PromptArgument, PromptTemplate, Resource, Role, Tool, ToolAnnotations,
+    PromptArgument, Resource, Role, Tool, ToolAnnotations,
 };
 use rmcp::object;
 
@@ -46,8 +49,23 @@ use xcap::{Monitor, Window};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PromptTemplate {
+    pub id: String,
+    pub template: String,
+    pub arguments: Vec<PromptArgumentTemplate>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PromptArgumentTemplate {
+    pub name: String,
+    pub description: Option<String>,
+    pub required: Option<bool>,
+}
+
 // Embeds the prompts directory to the build
 static PROMPTS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/developer/prompts");
+const LINE_READ_LIMIT: usize = 2000;
 
 /// Loads prompt files from the embedded PROMPTS_DIR and returns a HashMap of prompts.
 /// Ensures that each prompt name is unique.
@@ -90,6 +108,183 @@ pub fn load_prompt_files() -> HashMap<String, Prompt> {
     }
 
     prompts
+}
+
+/// Regex pattern to match file references (@-mentions) in text
+static FILE_REFERENCE_REGEX: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"(?:^|\s)@([a-zA-Z0-9_\-./]+(?:\.[a-zA-Z0-9]+)+|[A-Z][a-zA-Z0-9_\-]*|[a-zA-Z0-9_\-./]*[./][a-zA-Z0-9_\-./]*)")
+        .expect("Invalid file reference regex pattern")
+});
+
+/// Sanitize and resolve a file reference path safely
+///
+/// This function prevents path traversal attacks by:
+/// 1. Rejecting absolute paths
+/// 2. Resolving the path canonically
+/// 3. Ensuring the resolved path stays within the allowed base directory
+fn sanitize_reference_path(reference: &Path, base_path: &Path) -> Result<PathBuf, std::io::Error> {
+    if reference.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Absolute paths not allowed in file references",
+        ));
+    }
+
+    let resolved = base_path.join(reference);
+    let base_canonical = base_path.canonicalize().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "Base directory not found")
+    })?;
+
+    if let Ok(canonical) = resolved.canonicalize() {
+        if !canonical.starts_with(&base_canonical) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Path traversal attempt detected",
+            ));
+        }
+        Ok(canonical)
+    } else {
+        Ok(resolved) // File doesn't exist, but path structure is safe
+    }
+}
+
+/// Parse file references (@-mentions) from content
+fn parse_file_references(content: &str) -> Vec<PathBuf> {
+    // Keep size limits for ReDoS protection - .goosehints should be reasonably sized
+    const MAX_CONTENT_LENGTH: usize = 131_072; // 128KB limit
+
+    if content.len() > MAX_CONTENT_LENGTH {
+        tracing::warn!(
+            "Content too large for file reference parsing: {} bytes (limit: {} bytes)",
+            content.len(),
+            MAX_CONTENT_LENGTH
+        );
+        return Vec::new();
+    }
+
+    FILE_REFERENCE_REGEX
+        .captures_iter(content)
+        .map(|cap| PathBuf::from(&cap[1]))
+        .collect()
+}
+
+/// Read referenced files and expand their content
+/// Check if a file reference should be processed
+fn should_process_reference_v2(
+    reference: &Path,
+    visited: &HashSet<PathBuf>,
+    base_path: &Path,
+    ignore_patterns: &Gitignore,
+) -> Option<PathBuf> {
+    // Check if we've already visited this file (circular reference protection)
+    if visited.contains(reference) {
+        return None;
+    }
+
+    // Sanitize the path
+    let safe_path = match sanitize_reference_path(reference, base_path) {
+        Ok(path) => path,
+        Err(_) => {
+            tracing::warn!("Skipping unsafe file reference: {:?}", reference);
+            return None;
+        }
+    };
+
+    // Check if the file should be ignored
+    if ignore_patterns.matched(&safe_path, false).is_ignore() {
+        tracing::debug!("Skipping ignored file reference: {:?}", safe_path);
+        return None;
+    }
+
+    // Check if file exists
+    if !safe_path.is_file() {
+        return None;
+    }
+
+    Some(safe_path)
+}
+
+/// Process a single file reference and return the replacement content
+fn process_file_reference_v2(
+    reference: &Path,
+    safe_path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    base_path: &Path,
+    depth: usize,
+    ignore_patterns: &Gitignore,
+) -> Option<(String, String)> {
+    match std::fs::read_to_string(safe_path) {
+        Ok(file_content) => {
+            // Mark this file as visited
+            visited.insert(reference.to_path_buf());
+
+            // Recursively expand any references in the included file
+            let expanded_content = read_referenced_files(
+                &file_content,
+                base_path,
+                visited,
+                depth + 1,
+                ignore_patterns,
+            );
+
+            // Create the replacement content
+            let reference_pattern = format!("@{}", reference.to_string_lossy());
+            let replacement = format!(
+                "--- Content from {} ---\n{}\n--- End of {} ---",
+                reference.display(),
+                expanded_content,
+                reference.display()
+            );
+
+            // Remove from visited so it can be referenced again in different contexts
+            visited.remove(reference);
+
+            Some((reference_pattern, replacement))
+        }
+        Err(e) => {
+            tracing::warn!("Could not read referenced file {:?}: {}", safe_path, e);
+            None
+        }
+    }
+}
+
+fn read_referenced_files(
+    content: &str,
+    base_path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    depth: usize,
+    ignore_patterns: &Gitignore,
+) -> String {
+    const MAX_DEPTH: usize = 3;
+
+    if depth >= MAX_DEPTH {
+        tracing::warn!("Maximum reference depth {} exceeded", MAX_DEPTH);
+        return content.to_string();
+    }
+
+    let references = parse_file_references(content);
+    let mut result = content.to_string();
+
+    for reference in references {
+        let safe_path =
+            match should_process_reference_v2(&reference, visited, base_path, ignore_patterns) {
+                Some(path) => path,
+                None => continue,
+            };
+
+        if let Some((pattern, replacement)) = process_file_reference_v2(
+            &reference,
+            &safe_path,
+            visited,
+            base_path,
+            depth,
+            ignore_patterns,
+        ) {
+            result = result.replace(&pattern, &replacement);
+        }
+    }
+
+    result
 }
 
 pub struct DeveloperRouter {
@@ -153,13 +348,16 @@ impl DeveloperRouter {
                 If you need to run a long lived command, background it - e.g. `uvicorn main:app &` so that
                 this tool does not run indefinitely.
 
+                **Important**: Use ripgrep - `rg` - exclusively when you need to locate a file or a code reference,
+                other solutions may produce too large output because of hidden files! For example *do not* use `find` or `ls -r`
+                  - List files by name: `rg --files | rg <filename>`
+                  - List files that contain a regex: `rg '<regex>' -l`
+
                 **Important**: Each shell command runs in its own process. Things like directory changes or
                 sourcing files do not persist between tool calls. So you may need to repeat them each time by
                 stringing together commands, e.g. `cd example && ls` or `source env/bin/activate && pip install numpy`
-
-                - Restrictions: Avoid find, grep, cat, head, tail, ls - use dedicated tools instead (Grep, Glob, Read, LS)
-                - Multiple commands: Use ; or && to chain commands, avoid newlines
-                - Pathnames: Use absolute paths and avoid cd unless explicitly requested
+                  - Multiple commands: Use ; or && to chain commands, avoid newlines
+                  - Pathnames: Use absolute paths and avoid cd unless explicitly requested
             "#},
         };
 
@@ -174,86 +372,6 @@ impl DeveloperRouter {
                 }
             }),
         );
-
-        let glob_tool = Tool::new(
-            "glob".to_string(),
-            indoc! {r#"
-                Search for files using glob patterns.
-                
-                This tool provides fast file pattern matching using glob syntax.
-                Returns matching file paths sorted by modification time.
-                Examples:
-                - `*.rs` - Find all Rust files in current directory
-                - `src/**/*.py` - Find all Python files recursively in src directory
-                - `**/test*.js` - Find all JavaScript test files recursively
-                
-                **Important**: Use this tool instead of shell commands like `find` or `ls -r` for file searching,
-                as it properly handles ignored files and is more efficient. This tool respects .gooseignore patterns.
-                
-                Use this tool when you need to locate files by name patterns rather than content.
-            "#}.to_string(),
-            object!({
-                "type": "object",
-                "required": ["pattern"],
-                "properties": {
-                    "pattern": {"type": "string", "description": "The glob pattern to search for"},
-                    "path": {"type": "string", "description": "The directory to search in (defaults to current directory)"}
-                }
-            })
-        ).annotate(ToolAnnotations {
-            title: Some("Search files by pattern".to_string()),
-            read_only_hint: Some(true),
-            destructive_hint: Some(false),
-            idempotent_hint: Some(true),
-            open_world_hint: Some(false),
-        });
-
-        let grep_tool = Tool::new(
-            "grep".to_string(),
-            indoc! {r#"
-                Execute file content search commands using ripgrep, grep, or find.
-                
-                Use this tool to run search commands that look for content within files. The tool
-                executes your command directly and filters results to respect .gooseignore patterns.
-                
-                **Recommended tools and usage:**
-                
-                **ripgrep (rg)** - Fast, recommended for most searches:
-                - List files containing pattern: `rg -l "pattern"`
-                - Case-insensitive search: `rg -i "pattern"`
-                - Search specific file types: `rg "pattern" --glob "*.js"`
-                - Show matches with context: `rg "pattern" -C 3`
-                - List files by name: `rg --files | rg <filename>`
-                - List files that contain a regex: `rg '<regex>' -l`
-                - Sort by modification time: `rg -l "pattern" --sort modified`
-                
-                **grep** - Traditional Unix tool:
-                - Recursive search: `grep -r "pattern" .`
-                - List files only: `grep -rl "pattern" .`
-                - Include specific files: `grep -r "pattern" --include="*.py"`
-                
-                **find + grep** - When you need complex file filtering:
-                - `find . -name "*.py" -exec grep -l "pattern" {} \;`
-                - `find . -type f -newer file.txt -exec grep "pattern" {} \;`
-                
-                **Important**: Use this tool instead of the shell tool for search commands, as it
-                properly filters results to respect ignored files.
-            "#}
-            .to_string(),
-            object!({
-                "type": "object",
-                "required": ["command"],
-                "properties": {
-                    "command": {"type": "string", "description": "The search command to execute (rg, grep, find, etc.)"}
-                }
-            })
-        ).annotate(ToolAnnotations {
-            title: Some("Search file contents".to_string()),
-            read_only_hint: Some(true),
-            destructive_hint: Some(false),
-            idempotent_hint: Some(true),
-            open_world_hint: Some(false),
-        });
 
         // Create text editor tool with different descriptions based on editor API configuration
         let (text_editor_desc, str_replace_command) = if let Some(ref editor) = editor_model {
@@ -270,11 +388,13 @@ impl DeveloperRouter {
 
                 To use the write command, you must specify `file_text` which will become the new content of the file. Be careful with
                 existing files! This is a full overwrite, so you must include everything - not just sections you are modifying.
-
-                To use the edit_file command, you must specify both `old_str` and `new_str` - {}.
-
+                
                 To use the insert command, you must specify both `insert_line` (the line number after which to insert, 0 for beginning) 
                 and `new_str` (the text to insert).
+
+                To use the edit_file command, you must specify both `old_str` and `new_str` 
+                {}
+                
             "#, editor.get_str_replace_description()},
                 "edit_file",
             )
@@ -501,32 +621,11 @@ impl DeveloperRouter {
             }
         }
 
-        let mut hints = String::new();
-        if !global_hints_contents.is_empty() {
-            hints.push_str("\n### Global Hints\nThe developer extension includes some global hints that apply to all projects & directories.\n");
-            hints.push_str(&global_hints_contents.join("\n"));
-        }
-
-        if !local_hints_contents.is_empty() {
-            if !hints.is_empty() {
-                hints.push_str("\n\n");
-            }
-            hints.push_str("### Project Hints\nThe developer extension includes some hints for working on the project in this directory.\n");
-            hints.push_str(&local_hints_contents.join("\n"));
-        }
-
-        // Return base instructions directly when no hints are found
-        let instructions = if hints.is_empty() {
-            base_instructions
-        } else {
-            format!("{base_instructions}\n{hints}")
-        };
-
+        // Build ignore patterns first so we can use them for file reference expansion
         let mut builder = GitignoreBuilder::new(cwd.clone());
         let mut has_ignore_file = false;
+
         // Initialize ignore patterns
-        // - macOS/Linux: ~/.config/goose/
-        // - Windows:     ~\AppData\Roaming\Block\goose\config\
         let global_ignore_path = choose_app_strategy(crate::APP_STRATEGY.clone())
             .map(|strategy| strategy.in_config_dir(".gooseignore"))
             .unwrap_or_else(|_| {
@@ -572,11 +671,53 @@ impl DeveloperRouter {
 
         let ignore_patterns = builder.build().expect("Failed to build ignore patterns");
 
+        // Now process hints with file reference expansion
+        let mut hints = String::new();
+        if !global_hints_contents.is_empty() {
+            hints.push_str("\n### Global Hints\nThe developer extension includes some global hints that apply to all projects & directories.\n");
+
+            // Expand file references in global hints
+            let mut visited = HashSet::new();
+            let global_hints_text = global_hints_contents.join("\n");
+            let global_config_dir = choose_app_strategy(crate::APP_STRATEGY.clone())
+                .map(|strategy| strategy.config_dir())
+                .unwrap_or_else(|_| {
+                    PathBuf::from(shellexpand::tilde("~/.config/goose").to_string())
+                });
+            let expanded_global_hints = read_referenced_files(
+                &global_hints_text,
+                &global_config_dir,
+                &mut visited,
+                0,
+                &ignore_patterns,
+            );
+            hints.push_str(&expanded_global_hints);
+        }
+
+        if !local_hints_contents.is_empty() {
+            if !hints.is_empty() {
+                hints.push_str("\n\n");
+            }
+            hints.push_str("### Project Hints\nThe developer extension includes some hints for working on the project in this directory.\n");
+
+            // Expand file references in local hints
+            let mut visited = HashSet::new();
+            let local_hints_text = local_hints_contents.join("\n");
+            let expanded_local_hints =
+                read_referenced_files(&local_hints_text, &cwd, &mut visited, 0, &ignore_patterns);
+            hints.push_str(&expanded_local_hints);
+        }
+
+        // Return base instructions directly when no hints are found
+        let instructions = if hints.is_empty() {
+            base_instructions
+        } else {
+            format!("{base_instructions}\n{hints}")
+        };
+
         Self {
             tools: vec![
                 bash_tool,
-                glob_tool,
-                grep_tool,
                 text_editor_tool,
                 list_windows_tool,
                 screen_capture_tool,
@@ -697,88 +838,50 @@ impl DeveloperRouter {
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .kill_on_drop(true)
+            .env("GOOSE_TERMINAL", "1")
             .args(&shell_config.args)
             .arg(command)
             .spawn()
             .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
 
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-
-        let mut stdout_reader = BufReader::new(stdout);
-        let mut stderr_reader = BufReader::new(stderr);
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stderr = BufReader::new(child.stderr.take().unwrap());
 
         let output_task = tokio::spawn(async move {
             let mut combined_output = String::new();
 
-            let mut stdout_buf = Vec::new();
-            let mut stderr_buf = Vec::new();
+            // We have the individual two streams above, now merge them into one unified stream of
+            // an enum. ref https://blog.yoshuawuyts.com/futures-concurrency-3
+            let stdout = SplitStream::new(stdout.split(b'\n')).map(|v| ("stdout", v));
+            let stderr = SplitStream::new(stderr.split(b'\n')).map(|v| ("stderr", v));
+            let mut merged = stdout.merge(stderr);
 
-            let mut stdout_done = false;
-            let mut stderr_done = false;
+            while let Some((key, line)) = merged.next().await {
+                let mut line = line?;
+                // Re-add this as clients expect it
+                line.push(b'\n');
+                // Here we always convert to UTF-8 so agents don't have to deal with corrupted output
+                let line = String::from_utf8_lossy(&line);
 
-            loop {
-                tokio::select! {
-                    n = stdout_reader.read_until(b'\n', &mut stdout_buf), if !stdout_done => {
-                        if n? == 0 {
-                            stdout_done = true;
-                        } else {
-                            let line = String::from_utf8_lossy(&stdout_buf);
+                combined_output.push_str(&line);
 
-                            notifier.try_send(JsonRpcMessage::Notification(JsonRpcNotification {
-                                jsonrpc: JsonRpcVersion2_0,
-                                notification: Notification {
-                                    method: "notifications/message".to_string(),
-                                    params: object!({
-                                        "level": "info",
-                                        "data": {
-                                            "type": "shell",
-                                            "stream": "stdout",
-                                            "output": line.to_string(),
-                                        }
-                                    }),
-                                    extensions: Default::default(),
+                notifier
+                    .try_send(JsonRpcMessage::Notification(JsonRpcNotification {
+                        jsonrpc: JsonRpcVersion2_0,
+                        notification: Notification {
+                            method: "notifications/message".to_string(),
+                            params: object!({
+                                "level": "info",
+                                "data": {
+                                    "type": "shell",
+                                    "stream": key,
+                                    "output": line,
                                 }
-                            })).ok();
-
-                            combined_output.push_str(&line);
-                            stdout_buf.clear();
-                        }
-                    }
-
-                    n = stderr_reader.read_until(b'\n', &mut stderr_buf), if !stderr_done => {
-                        if n? == 0 {
-                            stderr_done = true;
-                        } else {
-                            let line = String::from_utf8_lossy(&stderr_buf);
-
-                            notifier.try_send(JsonRpcMessage::Notification(JsonRpcNotification {
-                                jsonrpc: JsonRpcVersion2_0,
-                                notification: Notification {
-                                    method: "notifications/message".to_string(),
-                                    params: object!({
-                                        "level": "info",
-                                        "data": {
-                                            "type": "shell",
-                                            "stream": "stderr",
-                                            "output": line.to_string(),
-                                        }
-                                    }),
-                                    extensions: Default::default(),
-                                }
-                            })).ok();
-
-                            combined_output.push_str(&line);
-                            stderr_buf.clear();
-                        }
-                    }
-
-                    else => break,
-                }
-
-                if stdout_done && stderr_done {
-                    break;
-                }
+                            }),
+                            extensions: Default::default(),
+                        },
+                    }))
+                    .ok();
             }
             Ok::<_, std::io::Error>(combined_output)
         });
@@ -811,69 +914,6 @@ impl DeveloperRouter {
         Ok(vec![
             Content::text(final_output).with_audience(vec![Role::Assistant]),
             Content::text(user_output)
-                .with_audience(vec![Role::User])
-                .with_priority(0.0),
-        ])
-    }
-
-    async fn glob(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        let pattern =
-            params
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .ok_or(ToolError::InvalidParameters(
-                    "The pattern string is required".to_string(),
-                ))?;
-
-        let search_path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-
-        let full_pattern = if search_path == "." {
-            pattern.to_string()
-        } else {
-            format!("{}/{}", search_path.trim_end_matches('/'), pattern)
-        };
-
-        let glob_result = glob::glob(&full_pattern)
-            .map_err(|e| ToolError::InvalidParameters(format!("Invalid glob pattern: {}", e)))?;
-
-        let mut file_paths_with_metadata = Vec::new();
-
-        for entry in glob_result {
-            match entry {
-                Ok(path) => {
-                    // Check if the path should be ignored
-                    if !self.is_ignored(&path) {
-                        // Get file metadata for sorting by modification time
-                        if let Ok(metadata) = std::fs::metadata(&path) {
-                            if metadata.is_file() {
-                                let modified = metadata
-                                    .modified()
-                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                                file_paths_with_metadata.push((path, modified));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Error reading glob entry: {}", e);
-                }
-            }
-        }
-
-        // Sort by modification time (newest first)
-        file_paths_with_metadata.sort_by(|a, b| b.1.cmp(&a.1));
-
-        // Extract just the file paths
-        let file_paths: Vec<String> = file_paths_with_metadata
-            .into_iter()
-            .map(|(path, _)| path.to_string_lossy().to_string())
-            .collect();
-
-        let result = file_paths.join("\n");
-
-        Ok(vec![
-            Content::text(result.clone()).with_audience(vec![Role::Assistant]),
-            Content::text(result)
                 .with_audience(vec![Role::User])
                 .with_priority(0.0),
         ])
@@ -963,130 +1003,151 @@ impl DeveloperRouter {
         }
     }
 
+    // Helper method to validate and calculate view range indices
+    fn calculate_view_range(
+        &self,
+        view_range: Option<(usize, i64)>,
+        total_lines: usize,
+    ) -> Result<(usize, usize), ToolError> {
+        if let Some((start_line, end_line)) = view_range {
+            // Convert 1-indexed line numbers to 0-indexed
+            let start_idx = if start_line > 0 { start_line - 1 } else { 0 };
+            let end_idx = if end_line == -1 {
+                total_lines
+            } else {
+                std::cmp::min(end_line as usize, total_lines)
+            };
+
+            if start_idx >= total_lines {
+                return Err(ToolError::InvalidParameters(format!(
+                    "Start line {} is beyond the end of the file (total lines: {})",
+                    start_line, total_lines
+                )));
+            }
+
+            if start_idx >= end_idx {
+                return Err(ToolError::InvalidParameters(format!(
+                    "Start line {} must be less than end line {}",
+                    start_line, end_line
+                )));
+            }
+
+            Ok((start_idx, end_idx))
+        } else {
+            Ok((0, total_lines))
+        }
+    }
+
+    // Helper method to format file content with line numbers
+    fn format_file_content(
+        &self,
+        path: &Path,
+        lines: &[&str],
+        start_idx: usize,
+        end_idx: usize,
+        view_range: Option<(usize, i64)>,
+    ) -> String {
+        let display_content = if lines.is_empty() {
+            String::new()
+        } else {
+            let selected_lines: Vec<String> = lines[start_idx..end_idx]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| format!("{}: {}", start_idx + i + 1, line))
+                .collect();
+
+            selected_lines.join("\n")
+        };
+
+        let language = lang::get_language_identifier(path);
+        if view_range.is_some() {
+            formatdoc! {"
+                ### {path} (lines {start}-{end})
+                ```{language}
+                {content}
+                ```
+                ",
+                path=path.display(),
+                start=view_range.unwrap().0,
+                end=if view_range.unwrap().1 == -1 { "end".to_string() } else { view_range.unwrap().1.to_string() },
+                language=language,
+                content=display_content,
+            }
+        } else {
+            formatdoc! {"
+                ### {path}
+                ```{language}
+                {content}
+                ```
+                ",
+                path=path.display(),
+                language=language,
+                content=display_content,
+            }
+        }
+    }
+
     async fn text_editor_view(
         &self,
         path: &PathBuf,
         view_range: Option<(usize, i64)>,
     ) -> Result<Vec<Content>, ToolError> {
-        if path.is_file() {
-            // Check file size first (400KB limit)
-            const MAX_FILE_SIZE: u64 = 400 * 1024; // 400KB in bytes
-
-            let f = File::open(path)
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to open file: {}", e)))?;
-
-            let file_size = f
-                .metadata()
-                .map_err(|e| {
-                    ToolError::ExecutionError(format!("Failed to get file metadata: {}", e))
-                })?
-                .len();
-
-            if file_size > MAX_FILE_SIZE {
-                return Err(ToolError::ExecutionError(format!(
-                    "File '{}' is too large ({:.2}KB). Maximum size is 400KB to prevent memory issues.",
-                    path.display(),
-                    file_size as f64 / 1024.0
-                )));
-            }
-            // Ensure we never read over that limit even if the file is being concurrently mutated
-            // (e.g. it's a log file)
-            let mut f = f.take(MAX_FILE_SIZE);
-
-            let uri = Url::from_file_path(path)
-                .map_err(|_| ToolError::ExecutionError("Invalid file path".into()))?
-                .to_string();
-
-            let mut content = String::new();
-            f.read_to_string(&mut content)
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
-
-            let lines: Vec<&str> = content.lines().collect();
-            let total_lines = lines.len();
-
-            // Handle view_range if provided, otherwise show all lines
-            let (start_idx, end_idx) = if let Some((start_line, end_line)) = view_range {
-                // Convert 1-indexed line numbers to 0-indexed
-                let start_idx = if start_line > 0 { start_line - 1 } else { 0 };
-                let end_idx = if end_line == -1 {
-                    total_lines
-                } else {
-                    std::cmp::min(end_line as usize, total_lines)
-                };
-
-                if start_idx >= total_lines {
-                    return Err(ToolError::InvalidParameters(format!(
-                        "Start line {} is beyond the end of the file (total lines: {})",
-                        start_line, total_lines
-                    )));
-                }
-
-                if start_idx >= end_idx {
-                    return Err(ToolError::InvalidParameters(format!(
-                        "Start line {} must be less than end line {}",
-                        start_line, end_line
-                    )));
-                }
-
-                (start_idx, end_idx)
-            } else {
-                (0, total_lines)
-            };
-
-            // Always format lines with line numbers for better usability
-            let display_content = if total_lines == 0 {
-                String::new()
-            } else {
-                let selected_lines: Vec<String> = lines[start_idx..end_idx]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| format!("{}: {}", start_idx + i + 1, line))
-                    .collect();
-
-                selected_lines.join("\n")
-            };
-
-            let language = lang::get_language_identifier(path);
-            let formatted = if view_range.is_some() {
-                formatdoc! {"
-                    ### {path} (lines {start}-{end})
-                    ```{language}
-                    {content}
-                    ```
-                    ",
-                    path=path.display(),
-                    start=view_range.unwrap().0,
-                    end=if view_range.unwrap().1 == -1 { "end".to_string() } else { view_range.unwrap().1.to_string() },
-                    language=language,
-                    content=display_content,
-                }
-            } else {
-                formatdoc! {"
-                    ### {path}
-                    ```{language}
-                    {content}
-                    ```
-                    ",
-                    path=path.display(),
-                    language=language,
-                    content=display_content,
-                }
-            };
-
-            // The LLM gets just a quick update as we expect the file to view in the status
-            // but we send a low priority message for the human
-            Ok(vec![
-                Content::embedded_text(uri, content).with_audience(vec![Role::Assistant]),
-                Content::text(formatted)
-                    .with_audience(vec![Role::User])
-                    .with_priority(0.0),
-            ])
-        } else {
-            Err(ToolError::ExecutionError(format!(
+        if !path.is_file() {
+            return Err(ToolError::ExecutionError(format!(
                 "The path '{}' does not exist or is not a file.",
                 path.display()
-            )))
+            )));
         }
+
+        const MAX_FILE_SIZE: u64 = 400 * 1024; // 400KB
+
+        let f = File::open(path)
+            .map_err(|e| ToolError::ExecutionError(format!("Failed to open file: {}", e)))?;
+
+        let file_size = f
+            .metadata()
+            .map_err(|e| ToolError::ExecutionError(format!("Failed to get file metadata: {}", e)))?
+            .len();
+
+        if file_size > MAX_FILE_SIZE {
+            return Err(ToolError::ExecutionError(format!(
+                "File '{}' is too large ({:.2}KB). Maximum size is 400KB to prevent memory issues.",
+                path.display(),
+                file_size as f64 / 1024.0
+            )));
+        }
+
+        // Ensure we never read over that limit even if the file is being concurrently mutated
+        let mut f = f.take(MAX_FILE_SIZE);
+
+        let uri = Url::from_file_path(path)
+            .map_err(|_| ToolError::ExecutionError("Invalid file path".into()))?
+            .to_string();
+
+        let mut content = String::new();
+        f.read_to_string(&mut content)
+            .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
+
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+
+        // We will gently encourage the LLM to specify a range for large line count files
+        // it can of course specify exact range to read any size file
+        if view_range.is_none() && total_lines > LINE_READ_LIMIT {
+            return recommend_read_range(path, total_lines);
+        }
+
+        let (start_idx, end_idx) = self.calculate_view_range(view_range, total_lines)?;
+        let formatted = self.format_file_content(path, &lines, start_idx, end_idx, view_range);
+
+        // The LLM gets just a quick update as we expect the file to view in the status
+        // but we send a low priority message for the human
+        Ok(vec![
+            Content::embedded_text(uri, content).with_audience(vec![Role::Assistant]),
+            Content::text(formatted)
+                .with_audience(vec![Role::User])
+                .with_priority(0.0),
+        ])
     }
 
     async fn text_editor_write(
@@ -1606,6 +1667,15 @@ impl DeveloperRouter {
     }
 }
 
+fn recommend_read_range(path: &Path, total_lines: usize) -> Result<Vec<Content>, ToolError> {
+    Err(ToolError::ExecutionError(format!(
+        "File '{}' is {} lines long, recommended to read in with view_range (or searching) to get bite size content. If you do wish to read all the file, please pass in view_range with [1, {}] to read it all at once",
+        path.display(),
+        total_lines,
+        total_lines
+    )))
+}
+
 impl Router for DeveloperRouter {
     fn name(&self) -> String {
         "developer".to_string()
@@ -1637,8 +1707,6 @@ impl Router for DeveloperRouter {
         Box::pin(async move {
             match tool_name.as_str() {
                 "shell" => this.bash(arguments, notifier).await,
-                "glob" => this.glob(arguments).await,
-                "grep" => this.bash(arguments, notifier).await,
                 "text_editor" => this.text_editor(arguments).await,
                 "list_windows" => this.list_windows(arguments).await,
                 "screen_capture" => this.screen_capture(arguments).await,
@@ -1700,7 +1768,7 @@ impl Clone for DeveloperRouter {
             instructions: self.instructions.clone(),
             file_history: Arc::clone(&self.file_history),
             ignore_patterns: Arc::clone(&self.ignore_patterns),
-            editor_model: create_editor_model(), // Recreate the editor model since it's not Clone
+            editor_model: create_editor_model(),
         }
     }
 }
@@ -2425,33 +2493,28 @@ mod tests {
         assert!(text_editor_tool
             .description
             .as_ref()
-            .map_or(false, |desc| desc
-                .contains("Replace a string in a file with a new string")));
+            .is_some_and(|desc| desc.contains("Replace a string in a file with a new string")));
         assert!(text_editor_tool
             .description
             .as_ref()
-            .map_or(false, |desc| desc
-                .contains("the `old_str` needs to exactly match one")));
+            .is_some_and(|desc| desc.contains("the `old_str` needs to exactly match one")));
         assert!(text_editor_tool
             .description
             .as_ref()
-            .map_or(false, |desc| desc.contains("str_replace")));
+            .is_some_and(|desc| desc.contains("str_replace")));
 
         // Should not contain editor API description or edit_file command
         assert!(!text_editor_tool
             .description
             .as_ref()
-            .map_or(false, |desc| desc
-                .contains("Edit the file with the new content")));
+            .is_some_and(|desc| desc.contains("Edit the file with the new content")));
         assert!(!text_editor_tool
             .description
             .as_ref()
-            .map_or(false, |desc| desc.contains("edit_file")));
-        assert!(!text_editor_tool
-            .description
-            .as_ref()
-            .map_or(false, |desc| desc
-                .contains("work out how to place old_str with it intelligently")));
+            .is_some_and(|desc| desc.contains("edit_file")));
+        assert!(!text_editor_tool.description.as_ref().is_some_and(
+            |desc| desc.contains("work out how to place old_str with it intelligently")
+        ));
 
         temp_dir.close().unwrap();
     }
@@ -3228,6 +3291,226 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_text_editor_view_large_file_without_range() {
+        let router = get_router().await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("large_file.txt");
+        let file_path_str = file_path.to_str().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        // Create a file with more than LINE_READ_LIMIT lines
+        let mut content = String::new();
+        for i in 1..=LINE_READ_LIMIT + 1 {
+            content.push_str(&format!("Line {}\n", i));
+        }
+
+        router
+            .call_tool(
+                "text_editor",
+                json!({
+                    "command": "write",
+                    "path": file_path_str,
+                    "file_text": content
+                }),
+                dummy_sender(),
+            )
+            .await
+            .unwrap();
+
+        // Test viewing without view_range - should trigger the error
+        let result = router
+            .call_tool(
+                "text_editor",
+                json!({
+                    "command": "view",
+                    "path": file_path_str
+                }),
+                dummy_sender(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(matches!(err, ToolError::ExecutionError(_)));
+        assert!(err.to_string().contains("2001 lines long"));
+        assert!(err
+            .to_string()
+            .contains("recommended to read in with view_range"));
+        assert!(err
+            .to_string()
+            .contains("please pass in view_range with [1, 2001]"));
+
+        // Test viewing with view_range - should work
+        let result = router
+            .call_tool(
+                "text_editor",
+                json!({
+                    "command": "view",
+                    "path": file_path_str,
+                    "view_range": [1, 100]
+                }),
+                dummy_sender(),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let view_result = result.unwrap();
+        let text = view_result
+            .iter()
+            .find(|c| {
+                c.audience()
+                    .is_some_and(|roles| roles.contains(&Role::User))
+            })
+            .unwrap()
+            .as_text()
+            .unwrap();
+
+        // Should contain lines 1-100
+        assert!(text.text.contains("1: Line 1"));
+        assert!(text.text.contains("100: Line 100"));
+        assert!(!text.text.contains("101: Line 101"));
+
+        // Test viewing with explicit full range - should work
+        let result = router
+            .call_tool(
+                "text_editor",
+                json!({
+                    "command": "view",
+                    "path": file_path_str,
+                    "view_range": [1, 2001]
+                }),
+                dummy_sender(),
+            )
+            .await;
+
+        assert!(result.is_ok());
+
+        temp_dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_text_editor_view_file_with_exactly_2000_lines() {
+        let router = get_router().await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("file_2000.txt");
+        let file_path_str = file_path.to_str().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        // Create a file with exactly 2000 lines (should not trigger the check)
+        let mut content = String::new();
+        for i in 1..=2000 {
+            content.push_str(&format!("Line {}\n", i));
+        }
+
+        router
+            .call_tool(
+                "text_editor",
+                json!({
+                    "command": "write",
+                    "path": file_path_str,
+                    "file_text": content
+                }),
+                dummy_sender(),
+            )
+            .await
+            .unwrap();
+
+        // Test viewing without view_range - should work since it's exactly 2000 lines
+        let result = router
+            .call_tool(
+                "text_editor",
+                json!({
+                    "command": "view",
+                    "path": file_path_str
+                }),
+                dummy_sender(),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let view_result = result.unwrap();
+        let text = view_result
+            .iter()
+            .find(|c| {
+                c.audience()
+                    .is_some_and(|roles| roles.contains(&Role::User))
+            })
+            .unwrap()
+            .as_text()
+            .unwrap();
+
+        // Should contain all lines
+        assert!(text.text.contains("1: Line 1"));
+        assert!(text.text.contains("2000: Line 2000"));
+
+        temp_dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_text_editor_view_small_file_without_range() {
+        let router = get_router().await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("small_file.txt");
+        let file_path_str = file_path.to_str().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        // Create a file with less than 2000 lines
+        let mut content = String::new();
+        for i in 1..=100 {
+            content.push_str(&format!("Line {}\n", i));
+        }
+
+        router
+            .call_tool(
+                "text_editor",
+                json!({
+                    "command": "write",
+                    "path": file_path_str,
+                    "file_text": content
+                }),
+                dummy_sender(),
+            )
+            .await
+            .unwrap();
+
+        // Test viewing without view_range - should work fine
+        let result = router
+            .call_tool(
+                "text_editor",
+                json!({
+                    "command": "view",
+                    "path": file_path_str
+                }),
+                dummy_sender(),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let view_result = result.unwrap();
+        let text = view_result
+            .iter()
+            .find(|c| {
+                c.audience()
+                    .is_some_and(|roles| roles.contains(&Role::User))
+            })
+            .unwrap()
+            .as_text()
+            .unwrap();
+
+        // Should contain all lines
+        assert!(text.text.contains("1: Line 1"));
+        assert!(text.text.contains("100: Line 100"));
+
+        temp_dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_bash_output_truncation() {
         let temp_dir = tempfile::tempdir().unwrap();
         std::env::set_current_dir(&temp_dir).unwrap();
@@ -3347,5 +3630,355 @@ mod tests {
         // Both outputs should be empty
         assert_eq!(result.0, "");
         assert_eq!(result.1, "");
+    }
+
+    // Tests for @-mention file reference functionality
+    #[test]
+    fn test_parse_file_references() {
+        let content = r#"
+        Basic file references: @README.md @./docs/guide.md @../shared/config.json @/absolute/path/file.txt
+        Inline references: @file1.txt and @file2.py
+        Files with extensions: @component.tsx @file.test.js @config.local.json
+        Files without extensions: @Makefile @LICENSE @Dockerfile @CHANGELOG
+        Complex paths: @src/utils/helper.js @docs/api/endpoints.md
+        
+        Should not match:
+        - Email addresses: user@example.com admin@company.org
+        - Social handles: @username @user123
+        - URLs: https://example.com/@user
+        "#;
+
+        let references = parse_file_references(content);
+
+        // Should match basic file references
+        assert!(references.contains(&PathBuf::from("README.md")));
+        assert!(references.contains(&PathBuf::from("./docs/guide.md")));
+        assert!(references.contains(&PathBuf::from("../shared/config.json")));
+        assert!(references.contains(&PathBuf::from("/absolute/path/file.txt")));
+        assert!(references.contains(&PathBuf::from("file1.txt")));
+        assert!(references.contains(&PathBuf::from("file2.py")));
+
+        // Should match files with extensions (including multiple dots)
+        assert!(references.contains(&PathBuf::from("component.tsx")));
+        assert!(references.contains(&PathBuf::from("file.test.js")));
+        assert!(references.contains(&PathBuf::from("config.local.json")));
+
+        // Should match files without extensions
+        assert!(references.contains(&PathBuf::from("Makefile")));
+        assert!(references.contains(&PathBuf::from("LICENSE")));
+        assert!(references.contains(&PathBuf::from("Dockerfile")));
+        assert!(references.contains(&PathBuf::from("CHANGELOG")));
+
+        // Should match complex paths
+        assert!(references.contains(&PathBuf::from("src/utils/helper.js")));
+        assert!(references.contains(&PathBuf::from("docs/api/endpoints.md")));
+
+        // Should not match email addresses or social handles
+        assert!(!references
+            .iter()
+            .any(|p| p.to_str().unwrap().contains("example.com")));
+        assert!(!references
+            .iter()
+            .any(|p| p.to_str().unwrap().contains("company.org")));
+        assert!(!references.iter().any(|p| p.to_str().unwrap() == "username"));
+        assert!(!references.iter().any(|p| p.to_str().unwrap() == "user123"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_file_expansion_normal_cases() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path();
+
+        // Test 1: Basic file reference
+        let basic_file = base_path.join("basic.md");
+        std::fs::write(&basic_file, "This is basic content").unwrap();
+
+        let builder = GitignoreBuilder::new(base_path);
+        let ignore_patterns = builder.build().unwrap();
+
+        let mut visited = HashSet::new();
+        let basic_content = "Main content\n@basic.md\nMore content";
+        let expanded =
+            read_referenced_files(basic_content, base_path, &mut visited, 0, &ignore_patterns);
+
+        assert!(expanded.contains("Main content"));
+        assert!(expanded.contains("--- Content from"));
+        assert!(expanded.contains("This is basic content"));
+        assert!(expanded.contains("--- End of"));
+        assert!(expanded.contains("More content"));
+
+        // Test 2: Nested file references
+        let ref_file1 = base_path.join("level1.md");
+        std::fs::write(&ref_file1, "Level 1 content\n@level2.md").unwrap();
+
+        let ref_file2 = base_path.join("level2.md");
+        std::fs::write(&ref_file2, "Level 2 content").unwrap();
+
+        visited.clear();
+        let nested_content = "Main content\n@level1.md";
+        let expanded =
+            read_referenced_files(nested_content, base_path, &mut visited, 0, &ignore_patterns);
+
+        assert!(expanded.contains("Main content"));
+        assert!(expanded.contains("Level 1 content"));
+        assert!(expanded.contains("Level 2 content"));
+
+        temp_dir.close().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_file_expansion_edge_cases() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path();
+        let builder = GitignoreBuilder::new(base_path);
+        let ignore_patterns = builder.build().unwrap();
+
+        // Test 1: Circular references
+        let ref_file1 = base_path.join("file1.md");
+        std::fs::write(&ref_file1, "File 1\n@file2.md").unwrap();
+        let ref_file2 = base_path.join("file2.md");
+        std::fs::write(&ref_file2, "File 2\n@file1.md").unwrap();
+
+        let mut visited = HashSet::new();
+        let circular_content = "Main\n@file1.md";
+        let expanded = read_referenced_files(
+            circular_content,
+            base_path,
+            &mut visited,
+            0,
+            &ignore_patterns,
+        );
+
+        assert!(expanded.contains("File 1"));
+        assert!(expanded.contains("File 2"));
+        // Should only appear once due to circular reference protection
+        let file1_count = expanded.matches("File 1").count();
+        assert_eq!(file1_count, 1);
+
+        // Test 2: Max depth limit
+        for i in 1..=5 {
+            let content = if i < 5 {
+                format!("Level {} content\n@level{}.md", i, i + 1)
+            } else {
+                format!("Level {} content", i)
+            };
+            let ref_file = base_path.join(format!("level{}.md", i));
+            std::fs::write(&ref_file, content).unwrap();
+        }
+
+        visited.clear();
+        let depth_content = "Main\n@level1.md";
+        let expanded =
+            read_referenced_files(depth_content, base_path, &mut visited, 0, &ignore_patterns);
+
+        // Should contain up to level 3 (MAX_DEPTH = 3)
+        assert!(expanded.contains("Level 1 content"));
+        assert!(expanded.contains("Level 2 content"));
+        assert!(expanded.contains("Level 3 content"));
+        // Should not contain level 4 or 5 due to depth limit
+        assert!(!expanded.contains("Level 4 content"));
+        assert!(!expanded.contains("Level 5 content"));
+
+        // Test 3: Missing file
+        visited.clear();
+        let missing_content = "Main\n@missing.md\nMore content";
+        let expanded = read_referenced_files(
+            missing_content,
+            base_path,
+            &mut visited,
+            0,
+            &ignore_patterns,
+        );
+
+        // Should keep the original reference unchanged
+        assert!(expanded.contains("@missing.md"));
+        assert!(!expanded.contains("--- Content from"));
+
+        temp_dir.close().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_read_referenced_files_respects_ignore() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path();
+
+        // Create referenced files
+        let allowed_file = base_path.join("allowed.md");
+        std::fs::write(&allowed_file, "Allowed content").unwrap();
+
+        let ignored_file = base_path.join("secret.md");
+        std::fs::write(&ignored_file, "Secret content").unwrap();
+
+        // Create main content with references
+        let content = "Main\n@allowed.md\n@secret.md";
+
+        // Create ignore patterns
+        let mut builder = GitignoreBuilder::new(base_path);
+        builder.add_line(None, "secret.md").unwrap();
+        let ignore_patterns = builder.build().unwrap();
+
+        let mut visited = HashSet::new();
+        let expanded = read_referenced_files(content, base_path, &mut visited, 0, &ignore_patterns);
+
+        // Should contain allowed content but not ignored content
+        assert!(expanded.contains("Allowed content"));
+        assert!(!expanded.contains("Secret content"));
+
+        // The @secret.md reference should remain unchanged
+        assert!(expanded.contains("@secret.md"));
+
+        temp_dir.close().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_goosehints_with_file_references() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        // Create referenced files
+        let readme_path = temp_dir.path().join("README.md");
+        std::fs::write(
+            &readme_path,
+            "# Project README\n\nThis is the project documentation.",
+        )
+        .unwrap();
+
+        let guide_path = temp_dir.path().join("guide.md");
+        std::fs::write(&guide_path, "# Development Guide\n\nFollow these steps...").unwrap();
+
+        // Create .goosehints with references
+        let hints_content = r#"# Project Information
+
+Please refer to:
+@README.md
+@guide.md
+
+Additional instructions here.
+"#;
+        let hints_path = temp_dir.path().join(".goosehints");
+        std::fs::write(&hints_path, hints_content).unwrap();
+
+        // Create router and check instructions
+        let router = DeveloperRouter::new();
+        let instructions = router.instructions();
+
+        // Should contain the .goosehints content
+        assert!(instructions.contains("Project Information"));
+        assert!(instructions.contains("Additional instructions here"));
+
+        // Should contain the referenced files' content
+        assert!(instructions.contains("# Project README"));
+        assert!(instructions.contains("This is the project documentation"));
+        assert!(instructions.contains("# Development Guide"));
+        assert!(instructions.contains("Follow these steps"));
+
+        // Should have attribution markers
+        assert!(instructions.contains("--- Content from"));
+        assert!(instructions.contains("--- End of"));
+
+        temp_dir.close().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_file_references_redos_protection() {
+        // Test very large input to ensure ReDoS protection
+        let large_content = "@".repeat(2_000_000); // 2MB of @ symbols
+        let references = parse_file_references(&large_content);
+        // Should return empty due to size limit, not hang
+        assert!(references.is_empty());
+
+        // Test normal size content still works
+        let normal_content = "Check out @README.md for details";
+        let references = parse_file_references(&normal_content);
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0], PathBuf::from("README.md"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_security_integration_with_file_expansion() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path();
+
+        // Create a config file attempting path traversal
+        let malicious_content = r#"
+        Normal content here.
+        @../../../etc/passwd
+        @/absolute/path/file.txt
+        @legitimate_file.md
+        "#;
+
+        // Create a legitimate file
+        let legit_file = base_path.join("legitimate_file.md");
+        std::fs::write(&legit_file, "This is safe content").unwrap();
+
+        // Create ignore patterns
+        let builder = GitignoreBuilder::new(base_path);
+        let ignore_patterns = builder.build().unwrap();
+
+        let mut visited = HashSet::new();
+        let expanded = read_referenced_files(
+            malicious_content,
+            base_path,
+            &mut visited,
+            0,
+            &ignore_patterns,
+        );
+
+        // Should contain the legitimate file but not the malicious attempts
+        assert!(expanded.contains("This is safe content"));
+        assert!(!expanded.contains("root:")); // Common content in /etc/passwd
+
+        // The malicious references should still be present (not expanded)
+        assert!(expanded.contains("@../../../etc/passwd"));
+        assert!(expanded.contains("@/absolute/path/file.txt"));
+
+        temp_dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_shell_output_without_trailing_newline() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        let router = get_router().await;
+
+        // Test command that outputs content without a trailing newline
+        let command = if cfg!(windows) {
+            "echo|set /p=\"Content without newline\""
+        } else {
+            "printf 'Content without newline'"
+        };
+
+        let result = router
+            .call_tool("shell", json!({ "command": command }), dummy_sender())
+            .await
+            .unwrap();
+
+        // Find the assistant content (which contains the full output)
+        let assistant_content = result
+            .iter()
+            .find(|c| {
+                c.audience()
+                    .is_some_and(|roles| roles.contains(&Role::Assistant))
+            })
+            .unwrap()
+            .as_text()
+            .unwrap();
+
+        // The output should contain the content even without a trailing newline
+        assert!(
+            assistant_content.text.contains("Content without newline"),
+            "Output should contain content even without trailing newline, but got: {}",
+            assistant_content.text
+        );
+
+        temp_dir.close().unwrap();
     }
 }
