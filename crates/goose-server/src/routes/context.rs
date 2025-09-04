@@ -53,10 +53,7 @@ async fn manage_context(
 ) -> Result<Json<ContextManageResponse>, StatusCode> {
     verify_secret_key(&headers, &state)?;
 
-    let agent = state
-        .get_agent()
-        .await
-        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
+    let agent = state.get_agent().await;
 
     let mut processed_messages = Conversation::new_unvalidated(vec![]);
     let mut token_counts: Vec<usize> = vec![];
@@ -67,7 +64,7 @@ async fn manage_context(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     } else if request.manage_action == "summarize" {
-        (processed_messages, token_counts) = agent
+        (processed_messages, token_counts, _) = agent
             .summarize_context(&request.messages)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

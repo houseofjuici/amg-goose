@@ -1,5 +1,5 @@
 use super::utils::verify_secret_key;
-use chrono::{DateTime, Datelike};
+use chrono::DateTime;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -7,7 +7,7 @@ use crate::state::AppState;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, put},
+    routing::{delete, get, put},
     Json, Router,
 };
 use goose::conversation::message::Message;
@@ -129,7 +129,7 @@ async fn get_session_history(
     let messages = match session::read_messages(&session_path) {
         Ok(messages) => messages,
         Err(e) => {
-            tracing::error!("Failed to read session messages: {:?}", e);
+            error!("Failed to read session messages: {:?}", e);
             return Err(StatusCode::NOT_FOUND);
         }
     };
@@ -261,55 +261,6 @@ async fn get_session_insights(
 }
 
 #[utoipa::path(
-    get,
-    path = "/sessions/activity-heatmap",
-    responses(
-        (status = 200, description = "Activity heatmap data", body = [ActivityHeatmapCell]),
-        (status = 401, description = "Unauthorized - Invalid or missing API key"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(("api_key" = [])),
-    tag = "Session Management"
-)]
-async fn get_activity_heatmap(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<ActivityHeatmapCell>>, StatusCode> {
-    verify_secret_key(&headers, &state)?;
-
-    let sessions = get_valid_sorted_sessions(SortOrder::Descending)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Only sessions with a description
-    let sessions: Vec<SessionInfo> = sessions
-        .into_iter()
-        .filter(|session| !session.metadata.description.is_empty())
-        .collect();
-
-    // Map: (week, day) -> count
-    let mut heatmap: std::collections::HashMap<(usize, usize), usize> =
-        std::collections::HashMap::new();
-
-    for session in &sessions {
-        if let Ok(date) =
-            chrono::NaiveDateTime::parse_from_str(&session.modified, "%Y-%m-%d %H:%M:%S UTC")
-        {
-            let date = date.date();
-            let week = date.iso_week().week() as usize - 1; // 0-based week
-            let day = date.weekday().num_days_from_sunday() as usize; // 0=Sun, 6=Sat
-            *heatmap.entry((week, day)).or_insert(0) += 1;
-        }
-    }
-
-    let mut result = Vec::new();
-    for ((week, day), count) in heatmap {
-        result.push(ActivityHeatmapCell { week, day, count });
-    }
-
-    Ok(Json(result))
-}
-
-#[utoipa::path(
     put,
     path = "/sessions/{session_id}/metadata",
     request_body = UpdateSessionMetadataRequest,
@@ -359,13 +310,55 @@ async fn update_session_metadata(
     Ok(StatusCode::OK)
 }
 
+#[utoipa::path(
+    delete,
+    path = "/sessions/{session_id}/delete",
+    params(
+        ("session_id" = String, Path, description = "Unique identifier for the session")
+    ),
+    responses(
+        (status = 200, description = "Session deleted successfully"),
+        (status = 401, description = "Unauthorized - Invalid or missing API key"),
+        (status = 404, description = "Session not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("api_key" = [])
+    ),
+    tag = "Session Management"
+)]
+// Delete a session
+async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    verify_secret_key(&headers, &state)?;
+
+    // Get the session path
+    let session_path = match session::get_path(session::Identifier::Name(session_id.clone())) {
+        Ok(path) => path,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    // Check if session file exists
+    if !session_path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Delete the session file
+    std::fs::remove_file(&session_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::OK)
+}
+
 // Configure routes for this module
 pub fn routes(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session_history))
+        .route("/sessions/{session_id}/delete", delete(delete_session))
         .route("/sessions/insights", get(get_session_insights))
-        .route("/sessions/activity-heatmap", get(get_activity_heatmap))
         .route(
             "/sessions/{session_id}/metadata",
             put(update_session_metadata),

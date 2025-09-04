@@ -8,8 +8,8 @@ use crate::{
 };
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use mcp_core::handler::ToolError;
 use rmcp::model::Tool;
+use rmcp::model::{ErrorCode, ErrorData};
 use serde::{Deserialize, Serialize};
 // use serde_json::{self};
 use crate::conversation::message::{Message, MessageContent, ToolRequest};
@@ -57,22 +57,27 @@ impl SubAgent {
         debug!("Creating new subagent with id: {}", task_config.id);
 
         // Create a new extension manager for this subagent
-        let mut extension_manager = ExtensionManager::new();
+        let extension_manager = ExtensionManager::new();
 
-        // Add extensions based on task_type:
-        // 1. If executing dynamic task (task_type = 'text_instruction'), default to using all enabled extensions
-        // 2. (TODO) If executing a sub-recipe task, only use recipe extensions
+        // Determine which extensions to add:
+        // 1. If task_config.extensions is Some(vec), use those specific extensions
+        // 2. If task_config.extensions is None, use all enabled extensions (backward compatibility)
 
-        // Get all enabled extensions from config
-        let enabled_extensions = ExtensionConfigManager::get_all()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|ext| ext.enabled)
-            .map(|ext| ext.config)
-            .collect::<Vec<ExtensionConfig>>();
+        let extensions_to_add = if let Some(ref extensions) = task_config.extensions {
+            // Use the explicitly specified extensions
+            extensions.clone()
+        } else {
+            // Default behavior: use all enabled extensions
+            ExtensionConfigManager::get_all()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|ext| ext.enabled)
+                .map(|ext| ext.config)
+                .collect::<Vec<ExtensionConfig>>()
+        };
 
-        // Add enabled extensions to the subagent's extension manager
-        for extension in enabled_extensions {
+        // Add the determined extensions to the subagent's extension manager
+        for extension in extensions_to_add {
             if let Err(e) = extension_manager.add_extension(extension).await {
                 debug!("Failed to add extension to subagent: {}", e);
                 // Continue with other extensions even if one fails
@@ -206,7 +211,11 @@ impl SubAgent {
                                 .await
                             {
                                 Ok(result) => result.result.await,
-                                Err(e) => Err(ToolError::ExecutionError(e.to_string())),
+                                Err(e) => Err(ErrorData::new(
+                                    ErrorCode::INTERNAL_ERROR,
+                                    e.to_string(),
+                                    None,
+                                )),
                             };
 
                             match tool_result {
@@ -220,7 +229,11 @@ impl SubAgent {
                                     // Create a user message with the tool error
                                     let tool_error_message = Message::user().with_tool_response(
                                         request.id.clone(),
-                                        Err(ToolError::ExecutionError(e.to_string())),
+                                        Err(ErrorData::new(
+                                            ErrorCode::INTERNAL_ERROR,
+                                            e.to_string(),
+                                            None,
+                                        )),
                                     );
                                     messages.push(tool_error_message);
                                 }

@@ -194,6 +194,7 @@ async fn add_extension(
             description: None,
             timeout,
             bundled: None,
+            available_tools: Vec::new(),
         },
         ExtensionConfigRequest::StreamableHttp {
             name,
@@ -211,6 +212,7 @@ async fn add_extension(
             description: None,
             timeout,
             bundled: None,
+            available_tools: Vec::new(),
         },
         ExtensionConfigRequest::Stdio {
             name,
@@ -241,6 +243,7 @@ async fn add_extension(
                 env_keys,
                 timeout,
                 bundled: None,
+                available_tools: Vec::new(),
             }
         }
         ExtensionConfigRequest::Builtin {
@@ -253,6 +256,7 @@ async fn add_extension(
             timeout,
             bundled: None,
             description: None,
+            available_tools: Vec::new(),
         },
         ExtensionConfigRequest::Frontend {
             name,
@@ -263,14 +267,11 @@ async fn add_extension(
             tools,
             instructions,
             bundled: None,
+            available_tools: Vec::new(),
         },
     };
 
-    // Get a reference to the agent
-    let agent = state
-        .get_agent()
-        .await
-        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
+    let agent = state.get_agent().await;
     let response = agent.add_extension(extension_config).await;
 
     // Respond with the result.
@@ -300,11 +301,7 @@ async fn remove_extension(
 ) -> Result<Json<ExtensionResponse>, StatusCode> {
     verify_secret_key(&headers, &state)?;
 
-    // Get a reference to the agent
-    let agent = state
-        .get_agent()
-        .await
-        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
+    let agent = state.get_agent().await;
     match agent.remove_extension(&name).await {
         Ok(_) => Ok(Json(ExtensionResponse {
             error: false,

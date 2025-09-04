@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useModelAndProvider } from '../components/ModelAndProviderContext';
 import { getCostForModel } from '../utils/costDatabase';
-import { SessionMetadata } from './useMessageStream';
+import { SessionMetadata } from '../api';
 
 interface UseCostTrackingProps {
   sessionInputTokens: number;
@@ -27,8 +27,8 @@ export const useCostTracking = ({
   }>({});
 
   const { currentModel, currentProvider } = useModelAndProvider();
-  const prevModelRef = useRef<string | undefined>();
-  const prevProviderRef = useRef<string | undefined>();
+  const prevModelRef = useRef<string | undefined>(undefined);
+  const prevProviderRef = useRef<string | undefined>(undefined);
 
   // Handle model changes and accumulate costs
   useEffect(() => {
